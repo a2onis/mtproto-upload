@@ -287,25 +287,65 @@ def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
 
 
 def _post_upload(
-    http: "requests_types.Session",
     url: str,
     path: Path,
     fields: dict[str, str],
     headers: dict[str, str],
 ) -> "requests_types.Response":
-    with path.open("rb") as handle:
-        return http.post(
-            url,
-            headers=headers,
-            data=fields,
-            files={"file": (path.name, handle, "text/plain")},
-            timeout=90,
-        )
+    req_headers = {**headers, "Connection": "close"}
+    last_exc: Exception | None = None
+    for _ in range(3):
+        try:
+            with path.open("rb") as handle:
+                return requests.post(
+                    url,
+                    headers=req_headers,
+                    data=fields,
+                    files={"file": (path.name, handle, "text/plain")},
+                    timeout=90,
+                )
+        except requests.exceptions.ConnectionError as exc:
+            last_exc = exc
+    assert last_exc is not None
+    raise last_exc
+
+
+def _extract_csrf_from_html(html_text: str) -> str:
+    meta_match = re.search(
+        r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']',
+        html_text or "",
+        re.IGNORECASE,
+    )
+    if meta_match:
+        return meta_match.group(1).strip()
+    json_match = re.search(r'"csrf_token"\s*:\s*"([^"]+)"', html_text or "")
+    if json_match:
+        return json_match.group(1).strip()
+    b64_match = re.search(
+        r'window\.bootstrapData\s*=\s*["\']([A-Za-z0-9+/=]+)["\']',
+        html_text or "",
+    )
+    if b64_match:
+        try:
+            import base64
+            decoded = base64.b64decode(b64_match.group(1)).decode("utf-8", errors="ignore")
+            inner = re.search(r'"csrf_token"\s*:\s*"([^"]+)"', decoded)
+            if inner:
+                return inner.group(1).strip()
+        except Exception:
+            pass
+    return ""
 
 
 def upload_file(path: Path) -> None:
     cookie = os.environ["UPLOADKON_COOKIE"].strip()
+    if cookie.lower().startswith("cookie:"):
+        cookie = cookie.split(":", 1)[1].strip()
     raw_xsrf = os.getenv("UPLOADKON_XSRF_TOKEN", "").strip()
+    if raw_xsrf.lower().startswith("x-xsrf-token:"):
+        raw_xsrf = raw_xsrf.split(":", 1)[1].strip()
+
+    cookie_dict = _parse_cookie_header(cookie)
     cookie_xsrf = _extract_xsrf_from_cookie(cookie)
     url = os.getenv("UPLOADKON_URL") or DEFAULT_UPLOAD_URL
     fields = {
@@ -329,45 +369,64 @@ def upload_file(path: Path) -> None:
     }
 
     candidates: list[str] = []
-    for candidate in (unquote(raw_xsrf), raw_xsrf, cookie_xsrf):
+    for candidate in (unquote(raw_xsrf), cookie_xsrf, raw_xsrf):
         if candidate and candidate not in candidates:
             candidates.append(candidate)
     if not candidates:
         candidates.append("")
 
-    http = requests.Session()
     response = None
     for xsrf in candidates:
         headers = {**base_headers, "Cookie": cookie, "X-XSRF-TOKEN": xsrf}
-        response = _post_upload(http, url, path, fields, headers)
+        response = _post_upload(url, path, fields, headers)
         if response.status_code != 419:
             break
 
     if response is not None and response.status_code == 419:
-        # Refresh CSRF/session cookies from /drive (handles expired 2h session when remember_web cookie is present).
-        refresh_session = requests.Session()
-        for k, v in _parse_cookie_header(cookie).items():
-            refresh_session.cookies.set(k, v, domain="my.uploadkon.ir")
-        drive_resp = refresh_session.get(
-            "https://my.uploadkon.ir/drive",
-            headers={
-                "User-Agent": base_headers["User-Agent"],
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
-            timeout=30,
-        )
-        refreshed_xsrf = unquote(refresh_session.cookies.get("XSRF-TOKEN", "") or "")
-        csrf_meta_match = re.search(
-            r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']',
-            drive_resp.text or "",
-            re.IGNORECASE,
-        )
-        headers = dict(base_headers)
-        if refreshed_xsrf:
-            headers["X-XSRF-TOKEN"] = refreshed_xsrf
-        if csrf_meta_match:
-            headers["X-CSRF-TOKEN"] = csrf_meta_match.group(1)
-        response = _post_upload(refresh_session, url, path, fields, headers)
+        # Refresh CSRF/session cookies from /drive.
+        drive_resp = None
+        for _ in range(3):
+            try:
+                drive_resp = requests.get(
+                    "https://my.uploadkon.ir/drive",
+                    headers={
+                        "Cookie": cookie,
+                        "User-Agent": base_headers["User-Agent"],
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Connection": "close",
+                    },
+                    allow_redirects=False,
+                    timeout=30,
+                )
+                break
+            except requests.exceptions.ConnectionError:
+                continue
+
+        if drive_resp is not None:
+            new_cookies = drive_resp.cookies.get_dict()
+            merged_cookies = {**cookie_dict, **new_cookies}
+            merged_cookie_str = "; ".join(f"{k}={v}" for k, v in merged_cookies.items())
+            refreshed_xsrf = unquote(merged_cookies.get("XSRF-TOKEN", "") or "")
+            csrf_token = _extract_csrf_from_html(drive_resp.text or "")
+            headers = {
+                **base_headers,
+                "Cookie": merged_cookie_str,
+                "X-XSRF-TOKEN": refreshed_xsrf or candidates[0],
+            }
+            if csrf_token:
+                headers["X-CSRF-TOKEN"] = csrf_token
+            retry_fields = {**fields, **({"_token": csrf_token} if csrf_token else {})}
+            response = _post_upload(url, path, retry_fields, headers)
+            if not response.ok:
+                snippet = response.text[:200].replace("\r", " ").replace("\n", " ")
+                loc = drive_resp.headers.get("Location", "")
+                raise RuntimeError(
+                    f"UploadKon HTTP {response.status_code}: {snippet} "
+                    f"(initial cookie keys={sorted(cookie_dict.keys())}, "
+                    f"/drive status={drive_resp.status_code}, redirect={loc!r}, "
+                    f"set-cookie keys={sorted(new_cookies.keys())}, "
+                    f"csrf_in_html={bool(csrf_token)})"
+                )
 
     assert response is not None
     if not response.ok:
