@@ -372,44 +372,44 @@ def upload_file(path: Path) -> None:
     # UPLOADKON_COOKIE only contains a long-lived remember_web_* cookie or when
     # the 2-hour laravel_session has rotated).
     import time
-    # Test GET /api/v1/drive/file-entries as Request #1
+    # Request 1: bootstrap session + XSRF-TOKEN via lightweight JSON API call
     t_get = time.monotonic()
-    try:
-        ent_resp = requests.get(
-            "https://my.uploadkon.ir/api/v1/drive/file-entries?perPage=5",
-            headers={
-                **base_headers,
-                "Cookie": cookie,
-            },
-            timeout=15,
-        )
-        dt_get = time.monotonic() - t_get
-        set_keys = sorted(ent_resp.cookies.get_dict().keys())
-        sample_names: list[str] = []
-        if ent_resp.ok:
-            try:
-                edata = ent_resp.json()
-                items = edata.get("data", []) if isinstance(edata, dict) else []
-                sample_names = [str(it.get("name")) for it in items[:5] if isinstance(it, dict)]
-            except Exception:
-                pass
-        print(
-            f"::notice::Req1 GET /api/v1/drive/file-entries status={ent_resp.status_code} "
-            f"in {dt_get:.2f}s, set_cookies={set_keys}, files={sample_names}, "
-            f"body={ent_resp.text[:120].replace(chr(10), ' ')}"
-        )
-        cookie_dict.update(ent_resp.cookies.get_dict())
-    except Exception as exc:
-        dt_get = time.monotonic() - t_get
-        print(f"::notice::Req1 GET /api/v1/drive/file-entries failed after {dt_get:.2f}s: {type(exc).__name__}: {exc}")
-
+    ent_resp = requests.get(
+        "https://my.uploadkon.ir/api/v1/drive/file-entries?perPage=5",
+        headers={
+            **base_headers,
+            "Cookie": cookie,
+            "Connection": "close",
+        },
+        timeout=15,
+    )
+    dt_get = time.monotonic() - t_get
+    cookie_dict.update(ent_resp.cookies.get_dict())
     merged_cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
     active_xsrf = unquote(cookie_dict.get("XSRF-TOKEN", "") or "") or unquoted_raw_xsrf
+    print(
+        f"::notice::Req1 GET status={ent_resp.status_code} in {dt_get:.2f}s, "
+        f"cookies={sorted(cookie_dict.keys())}"
+    )
+
     headers = {
         **base_headers,
         "Cookie": merged_cookie_str,
         "X-XSRF-TOKEN": active_xsrf,
+        "Connection": "close",
     }
+
+    # Request 2: verify authenticated session cookie works on a fast GET
+    t_get2 = time.monotonic()
+    try:
+        ent_resp2 = requests.get(
+            "https://my.uploadkon.ir/api/v1/drive/file-entries?perPage=1",
+            headers=headers,
+            timeout=10,
+        )
+        print(f"::notice::Req2 GET with session status={ent_resp2.status_code} in {time.monotonic() - t_get2:.2f}s")
+    except Exception as exc:
+        print(f"::notice::Req2 GET with session failed after {time.monotonic() - t_get2:.2f}s: {type(exc).__name__}")
 
     # Omit empty optional fields like parentId/relativePath if not set, matching Bedrive's FormData.
     post_fields: dict[str, str] = {
