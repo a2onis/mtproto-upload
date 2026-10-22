@@ -1,0 +1,47 @@
+name: Collect and upload MTProto proxies
+
+on:
+  schedule:
+    # 06:00 and 18:00 Asia/Tehran (UTC+03:30), year-round.
+    - cron: "30 2,14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CHANNEL_IDS: ${{ vars.CHANNEL_IDS }}
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+      UPLOADKON_COOKIE: ${{ secrets.UPLOADKON_COOKIE }}
+      UPLOADKON_XSRF_TOKEN: ${{ secrets.UPLOADKON_XSRF_TOKEN }}
+      UPLOADKON_URL: ${{ vars.UPLOADKON_URL }}
+      UPLOADKON_BACKEND_ID: ${{ vars.UPLOADKON_BACKEND_ID }}
+      UPLOADKON_PARENT_ID: ${{ vars.UPLOADKON_PARENT_ID }}
+      UPLOADKON_WORKSPACE_ID: ${{ vars.UPLOADKON_WORKSPACE_ID }}
+      UPLOADKON_UPLOAD_TYPE: ${{ vars.UPLOADKON_UPLOAD_TYPE }}
+      LOOKBACK_HOURS: "12"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Validate required secrets
+        run: |
+          test -n "$TELEGRAM_API_ID" || { echo 'Missing TELEGRAM_API_ID secret'; exit 1; }
+          test -n "$TELEGRAM_API_HASH" || { echo 'Missing TELEGRAM_API_HASH secret'; exit 1; }
+          test -n "$TELEGRAM_SESSION" || { echo 'Missing TELEGRAM_SESSION secret'; exit 1; }
+          test -n "$UPLOADKON_COOKIE" || { echo 'Missing UPLOADKON_COOKIE secret'; exit 1; }
+          test -n "$UPLOADKON_XSRF_TOKEN" || { echo 'Missing UPLOADKON_XSRF_TOKEN secret'; exit 1; }
+          test -n "$CHANNEL_IDS" || { echo 'Missing CHANNEL_IDS repository variable'; exit 1; }
+      - name: Collect and upload
+        run: python fetch_and_upload.py
