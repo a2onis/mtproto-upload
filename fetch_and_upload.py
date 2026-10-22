@@ -347,6 +347,13 @@ def upload_file(path: Path) -> None:
 
     cookie_dict = _parse_cookie_header(cookie)
     cookie_xsrf = _extract_xsrf_from_cookie(cookie)
+    unquoted_raw_xsrf = unquote(raw_xsrf)
+    print(
+        f"::notice::UploadKon diag: cookie_keys={sorted(cookie_dict.keys())}, "
+        f"raw_xsrf_len={len(unquoted_raw_xsrf)}, raw_starts_eyJ={unquoted_raw_xsrf.startswith('eyJ')}, "
+        f"cookie_xsrf_len={len(cookie_xsrf)}, matches_cookie={unquoted_raw_xsrf == cookie_xsrf}"
+    )
+
     url = os.getenv("UPLOADKON_URL") or DEFAULT_UPLOAD_URL
     fields = {
         "clientMime": "text/plain",
@@ -368,70 +375,35 @@ def upload_file(path: Path) -> None:
         ),
     }
 
-    candidates: list[str] = []
-    for candidate in (unquote(raw_xsrf), cookie_xsrf, raw_xsrf):
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
-    if not candidates:
-        candidates.append("")
+    headers = {**base_headers, "Cookie": cookie}
+    if cookie_xsrf:
+        headers["X-XSRF-TOKEN"] = cookie_xsrf
+    elif unquoted_raw_xsrf.startswith("eyJ"):
+        headers["X-XSRF-TOKEN"] = unquoted_raw_xsrf
+    elif unquoted_raw_xsrf:
+        headers["X-CSRF-TOKEN"] = unquoted_raw_xsrf
+        headers["X-XSRF-TOKEN"] = unquoted_raw_xsrf
 
-    response = None
-    for xsrf in candidates:
-        headers = {**base_headers, "Cookie": cookie, "X-XSRF-TOKEN": xsrf}
-        response = _post_upload(url, path, fields, headers)
-        if response.status_code != 419:
-            break
+    with path.open("rb") as handle:
+        response = requests.post(
+            url,
+            headers=headers,
+            data=fields,
+            files={"file": (path.name, handle, "text/plain")},
+            timeout=90,
+        )
 
-    if response is not None and response.status_code == 419:
-        # Refresh CSRF/session cookies from /drive.
-        drive_resp = None
-        for _ in range(3):
-            try:
-                drive_resp = requests.get(
-                    "https://my.uploadkon.ir/drive",
-                    headers={
-                        "Cookie": cookie,
-                        "User-Agent": base_headers["User-Agent"],
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Connection": "close",
-                    },
-                    allow_redirects=False,
-                    timeout=30,
-                )
-                break
-            except requests.exceptions.ConnectionError:
-                continue
-
-        if drive_resp is not None:
-            new_cookies = drive_resp.cookies.get_dict()
-            merged_cookies = {**cookie_dict, **new_cookies}
-            merged_cookie_str = "; ".join(f"{k}={v}" for k, v in merged_cookies.items())
-            refreshed_xsrf = unquote(merged_cookies.get("XSRF-TOKEN", "") or "")
-            csrf_token = _extract_csrf_from_html(drive_resp.text or "")
-            headers = {
-                **base_headers,
-                "Cookie": merged_cookie_str,
-                "X-XSRF-TOKEN": refreshed_xsrf or candidates[0],
-            }
-            if csrf_token:
-                headers["X-CSRF-TOKEN"] = csrf_token
-            retry_fields = {**fields, **({"_token": csrf_token} if csrf_token else {})}
-            response = _post_upload(url, path, retry_fields, headers)
-            if not response.ok:
-                snippet = response.text[:200].replace("\r", " ").replace("\n", " ")
-                loc = drive_resp.headers.get("Location", "")
-                raise RuntimeError(
-                    f"UploadKon HTTP {response.status_code}: {snippet} "
-                    f"(initial cookie keys={sorted(cookie_dict.keys())}, "
-                    f"/drive status={drive_resp.status_code}, redirect={loc!r}, "
-                    f"set-cookie keys={sorted(new_cookies.keys())}, "
-                    f"csrf_in_html={bool(csrf_token)})"
-                )
-
-    assert response is not None
     if not response.ok:
         snippet = response.text[:200].replace("\r", " ").replace("\n", " ")
         raise RuntimeError(f"UploadKon HTTP {response.status_code}: {snippet}")
+    try:
+        result = response.json()
+    except requests.exceptions.JSONDecodeError as exc:
+        raise RuntimeError("Upload endpoint did not return JSON") from exc
+    if not isinstance(result, (dict, list)):
+        raise RuntimeError("Upload endpoint returned an unexpected response")
+    print("Upload completed successfully.")
+    print("::notice::Upload to UploadKon completed successfully.")
     try:
         result = response.json()
     except requests.exceptions.JSONDecodeError as exc:
