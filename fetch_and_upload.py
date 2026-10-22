@@ -346,14 +346,7 @@ def upload_file(path: Path) -> None:
         raw_xsrf = raw_xsrf.split(":", 1)[1].strip()
 
     cookie_dict = _parse_cookie_header(cookie)
-    cookie_xsrf = _extract_xsrf_from_cookie(cookie)
     unquoted_raw_xsrf = unquote(raw_xsrf)
-    print(
-        f"::notice::UploadKon diag: cookie_keys={sorted(cookie_dict.keys())}, "
-        f"raw_xsrf_len={len(unquoted_raw_xsrf)}, raw_starts_eyJ={unquoted_raw_xsrf.startswith('eyJ')}, "
-        f"cookie_xsrf_len={len(cookie_xsrf)}, matches_cookie={unquoted_raw_xsrf == cookie_xsrf}"
-    )
-
     url = os.getenv("UPLOADKON_URL") or DEFAULT_UPLOAD_URL
     fields = {
         "clientMime": "text/plain",
@@ -375,20 +368,48 @@ def upload_file(path: Path) -> None:
         ),
     }
 
-    headers = {**base_headers, "Cookie": cookie}
-    if cookie_xsrf:
-        headers["X-XSRF-TOKEN"] = cookie_xsrf
-    elif unquoted_raw_xsrf.startswith("eyJ"):
-        headers["X-XSRF-TOKEN"] = unquoted_raw_xsrf
-    elif unquoted_raw_xsrf:
-        headers["X-CSRF-TOKEN"] = unquoted_raw_xsrf
-        headers["X-XSRF-TOKEN"] = unquoted_raw_xsrf
+    # Bootstrap/refresh session and XSRF-TOKEN from /drive first (essential when
+    # UPLOADKON_COOKIE only contains a long-lived remember_web_* cookie or when
+    # the 2-hour laravel_session has rotated).
+    csrf_token = ""
+    try:
+        drive_resp = requests.get(
+            "https://my.uploadkon.ir/drive",
+            headers={
+                "Cookie": cookie,
+                "User-Agent": base_headers["User-Agent"],
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            allow_redirects=False,
+            timeout=30,
+        )
+        new_cookies = drive_resp.cookies.get_dict()
+        cookie_dict.update(new_cookies)
+        csrf_token = _extract_csrf_from_html(drive_resp.text or "")
+        print(
+            f"::notice::UploadKon bootstrap /drive status={drive_resp.status_code}, "
+            f"set_cookie_keys={sorted(new_cookies.keys())}, "
+            f"merged_cookie_keys={sorted(cookie_dict.keys())}, "
+            f"csrf_in_html={bool(csrf_token)}"
+        )
+    except Exception as exc:
+        print(f"::notice::UploadKon bootstrap /drive skipped ({type(exc).__name__}: {exc})")
 
+    merged_cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
+    active_xsrf = unquote(cookie_dict.get("XSRF-TOKEN", "") or "") or unquoted_raw_xsrf
+
+    headers = {**base_headers, "Cookie": merged_cookie_str}
+    if active_xsrf:
+        headers["X-XSRF-TOKEN"] = active_xsrf
+    if csrf_token:
+        headers["X-CSRF-TOKEN"] = csrf_token
+
+    post_fields = {**fields, **({"_token": csrf_token} if csrf_token else {})}
     with path.open("rb") as handle:
         response = requests.post(
             url,
             headers=headers,
-            data=fields,
+            data=post_fields,
             files={"file": (path.name, handle, "text/plain")},
             timeout=90,
         )
