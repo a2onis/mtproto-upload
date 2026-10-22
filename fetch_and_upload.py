@@ -269,11 +269,6 @@ async def collect(channel_ids: list[str], api_id: int | None, api_hash: str, ses
     return configs
 
 
-def _extract_xsrf_from_cookie(cookie: str) -> str:
-    match = re.search(r"(?:^|;\s*)XSRF-TOKEN=([^;]+)", cookie)
-    return unquote(match.group(1).strip()) if match else ""
-
-
 def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
     jar: dict[str, str] = {}
     for part in cookie_header.split(";"):
@@ -284,57 +279,6 @@ def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
             if k:
                 jar[k] = v
     return jar
-
-
-def _post_upload(
-    url: str,
-    path: Path,
-    fields: dict[str, str],
-    headers: dict[str, str],
-) -> "requests_types.Response":
-    req_headers = {**headers, "Connection": "close"}
-    last_exc: Exception | None = None
-    for _ in range(3):
-        try:
-            with path.open("rb") as handle:
-                return requests.post(
-                    url,
-                    headers=req_headers,
-                    data=fields,
-                    files={"file": (path.name, handle, "text/plain")},
-                    timeout=90,
-                )
-        except requests.exceptions.ConnectionError as exc:
-            last_exc = exc
-    assert last_exc is not None
-    raise last_exc
-
-
-def _extract_csrf_from_html(html_text: str) -> str:
-    meta_match = re.search(
-        r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']',
-        html_text or "",
-        re.IGNORECASE,
-    )
-    if meta_match:
-        return meta_match.group(1).strip()
-    json_match = re.search(r'"csrf_token"\s*:\s*"([^"]+)"', html_text or "")
-    if json_match:
-        return json_match.group(1).strip()
-    b64_match = re.search(
-        r'window\.bootstrapData\s*=\s*["\']([A-Za-z0-9+/=]+)["\']',
-        html_text or "",
-    )
-    if b64_match:
-        try:
-            import base64
-            decoded = base64.b64decode(b64_match.group(1)).decode("utf-8", errors="ignore")
-            inner = re.search(r'"csrf_token"\s*:\s*"([^"]+)"', decoded)
-            if inner:
-                return inner.group(1).strip()
-        except Exception:
-            pass
-    return ""
 
 
 def upload_file(path: Path) -> None:
@@ -368,11 +312,8 @@ def upload_file(path: Path) -> None:
         ),
     }
 
-    # Bootstrap/refresh session and XSRF-TOKEN from /drive first (essential when
-    # UPLOADKON_COOKIE only contains a long-lived remember_web_* cookie or when
-    # the 2-hour laravel_session has rotated).
+    # Clamp TCP MSS to 1000 bytes to avoid PMTU blackholes on routes to .ir hosts.
     import socket
-    import time
     from urllib3.connection import HTTPConnection
     if hasattr(socket, "TCP_MAXSEG"):
         mss_opt = (socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1000)
@@ -382,8 +323,8 @@ def upload_file(path: Path) -> None:
                 mss_opt,
             ]
 
-    # Request 1: bootstrap session + XSRF-TOKEN via lightweight JSON API call
-    t_get = time.monotonic()
+    # Bootstrap/refresh active session and XSRF-TOKEN when UPLOADKON_COOKIE only
+    # contains a long-lived remember_web_* cookie or when the 2h session rotated.
     ent_resp = requests.get(
         "https://my.uploadkon.ir/api/v1/drive/file-entries?perPage=1",
         headers={
@@ -391,15 +332,10 @@ def upload_file(path: Path) -> None:
             "Cookie": cookie,
             "Connection": "close",
         },
-        timeout=15,
+        timeout=20,
     )
-    dt_get = time.monotonic() - t_get
     cookie_dict.update(ent_resp.cookies.get_dict())
     active_xsrf = unquote(cookie_dict.get("XSRF-TOKEN", "") or "") or unquoted_raw_xsrf
-    print(
-        f"::notice::Req1 GET status={ent_resp.status_code} in {dt_get:.2f}s, "
-        f"cookies={sorted(cookie_dict.keys())}"
-    )
 
     # Keep Cookie header compact (Laravel only needs aplod_kn_session in Cookie and X-XSRF-TOKEN in header)
     if "aplod_kn_session" in cookie_dict:
@@ -414,20 +350,14 @@ def upload_file(path: Path) -> None:
         "Connection": "close",
     }
 
-    t0 = time.monotonic()
-    try:
-        with path.open("rb") as handle:
-            response = requests.post(
-                url,
-                headers=headers,
-                data=fields,
-                files={"file": (path.name, handle, "text/plain")},
-                timeout=30,
-            )
-    except Exception as exc:
-        dt = time.monotonic() - t0
-        print(f"::notice::POST failed after {dt:.2f}s with {type(exc).__name__}: {exc}")
-        raise
+    with path.open("rb") as handle:
+        response = requests.post(
+            url,
+            headers=headers,
+            data=fields,
+            files={"file": (path.name, handle, "text/plain")},
+            timeout=60,
+        )
 
     if not response.ok:
         snippet = response.text[:200].replace("\r", " ").replace("\n", " ")
