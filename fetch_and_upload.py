@@ -427,12 +427,12 @@ def upload_file(path: Path) -> None:
     t0 = time.monotonic()
     try:
         with path.open("rb") as handle:
-            response = http.post(
+            response = requests.post(
                 url,
                 headers=headers,
                 data=post_fields,
                 files={"file": (path.name, handle, "text/plain")},
-                timeout=20,
+                timeout=30,
             )
     except Exception as exc:
         dt = time.monotonic() - t0
