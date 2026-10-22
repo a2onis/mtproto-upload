@@ -1,8 +1,14 @@
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from fetch_and_upload import DEFAULT_LOOKBACK_HOURS, extract_proxy_configs, make_filename
+from fetch_and_upload import (
+    DEFAULT_LOOKBACK_HOURS,
+    extract_proxy_configs,
+    make_filename,
+    normalize_channel_username,
+    parse_web_preview_page,
+)
 
 
 class ProxyExtractionTests(unittest.TestCase):
@@ -13,6 +19,16 @@ class ProxyExtractionTests(unittest.TestCase):
         )
         self.assertEqual(
             extract_proxy_configs(text),
+            ["tg://proxy?server=proxy.example&port=443&secret=abcdef"],
+        )
+
+    def test_extracts_html_escaped_links(self):
+        html_snippet = (
+            '<a href="https://t.me/proxy?server=proxy.example&amp;port=443&amp;secret=abcdef">'
+            "Connect</a>"
+        )
+        self.assertEqual(
+            extract_proxy_configs(html_snippet),
             ["tg://proxy?server=proxy.example&port=443&secret=abcdef"],
         )
 
@@ -27,6 +43,37 @@ class ProxyExtractionTests(unittest.TestCase):
     def test_keeps_distinct_configs(self):
         text = "tg://proxy?server=a&port=80&secret=x tg://proxy?server=b&port=443&secret=y"
         self.assertEqual(len(extract_proxy_configs(text)), 2)
+
+
+class ChannelNormalizationTests(unittest.TestCase):
+    def test_normalizes_public_usernames_and_urls(self):
+        self.assertEqual(normalize_channel_username("@public_chan"), "public_chan")
+        self.assertEqual(normalize_channel_username("public_chan"), "public_chan")
+        self.assertEqual(normalize_channel_username("https://t.me/s/public_chan"), "public_chan")
+        self.assertEqual(normalize_channel_username("https://t.me/public_chan"), "public_chan")
+        self.assertIsNone(normalize_channel_username("-100123456789"))
+
+
+class WebPreviewParsingTests(unittest.TestCase):
+    def test_parses_newest_first_until_cutoff(self):
+        page = """
+        <div class="tgme_widget_message" data-post="chan/10">
+          <time datetime="2026-10-22T01:00:00+00:00"></time>
+          <a href="https://t.me/proxy?server=old.example&amp;port=443&amp;secret=1111">Old</a>
+        </div>
+        <div class="tgme_widget_message" data-post="chan/11">
+          <time datetime="2026-10-22T15:00:00+00:00"></time>
+          <a href="https://t.me/proxy?server=new.example&amp;port=443&amp;secret=2222">New</a>
+        </div>
+        """
+        cutoff = datetime(2026, 10, 22, 10, 0, 0, tzinfo=timezone.utc)
+        configs, oldest_id, reached_cutoff = parse_web_preview_page(page, cutoff)
+        self.assertEqual(
+            configs,
+            ["tg://proxy?server=new.example&port=443&secret=2222"],
+        )
+        self.assertEqual(oldest_id, 10)
+        self.assertTrue(reached_cutoff)
 
 
 class LookbackTests(unittest.TestCase):

@@ -44,13 +44,18 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
       - name: Validate required secrets
         run: |
-          test -n "$TELEGRAM_API_ID" || { echo 'Missing TELEGRAM_API_ID secret'; exit 1; }
-          test -n "$TELEGRAM_API_HASH" || { echo 'Missing TELEGRAM_API_HASH secret'; exit 1; }
-          test -n "$TELEGRAM_SESSION" || { echo 'Missing TELEGRAM_SESSION secret'; exit 1; }
           test -n "$UPLOADKON_COOKIE" || { echo 'Missing UPLOADKON_COOKIE secret'; exit 1; }
-          test -n "$UPLOADKON_XSRF_TOKEN" || { echo 'Missing UPLOADKON_XSRF_TOKEN secret'; exit 1; }
-          test -n "$CHANNEL_IDS" || { echo 'Missing CHANNEL_IDS repository variable'; exit 1; }
+          test -n "$CHANNEL_IDS" || { echo 'Missing CHANNEL_IDS repository variable or secret'; exit 1; }
       - name: Collect and upload
         run: python fetch_and_upload.py
+      - name: Upload proxy list artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtproto-proxies
+          path: mtproto-proxies-*.txt
+          if-no-files-found: ignore

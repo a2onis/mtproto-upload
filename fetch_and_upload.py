@@ -2,32 +2,56 @@
 """Collect Telegram MTProto proxy links and upload them to UploadKon."""
 from __future__ import annotations
 
+import html
 import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlsplit
+from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
-import requests
-from telethon import TelegramClient
-from telethon.sessions import StringSession
+try:
+    import requests
+except ImportError:  # pragma: no cover
+    requests = None  # type: ignore[assignment]
+
+try:
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+except ImportError:  # pragma: no cover
+    TelegramClient = None  # type: ignore[assignment,misc]
+    StringSession = None  # type: ignore[assignment,misc]
+
+if TYPE_CHECKING:
+    import requests as requests_types
 
 TEHRAN = ZoneInfo("Asia/Tehran")
 DEFAULT_UPLOAD_URL = "https://my.uploadkon.ir/api/v1/file-entries"
 DEFAULT_LOOKBACK_HOURS = 12
+MAX_WEB_PAGES_PER_CHANNEL = 25
 # Telegram proxy links are commonly shared as tg://proxy or t.me/proxy URLs.
-LINK_RE = re.compile(r"(?:tg://proxy|https?://(?:t\.me|telegram\.me)/proxy)\?[^\s<>\"'`]+", re.IGNORECASE)
+LINK_RE = re.compile(
+    r"(?:tg://proxy|(?:https?://)?(?:t\.me|telegram\.me)/proxy)\?[^\s<>\"'`]+",
+    re.IGNORECASE,
+)
 TRAILING_PUNCTUATION = ").,;!?]}»'\""
+USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,}$")
+MESSAGE_BLOCK_SPLIT_RE = re.compile(r'(?=<div[^>]+class="[^"]*tgme_widget_message\b)', re.IGNORECASE)
+DATA_POST_RE = re.compile(r'\bdata-post="[^"/]+/(\d+)"', re.IGNORECASE)
+DATETIME_RE = re.compile(r'<time[^>]+datetime="([^"]+)"', re.IGNORECASE)
 
 
 def extract_proxy_configs(text: str) -> list[str]:
     """Return canonical tg://proxy links containing server, port and secret."""
     configs: list[str] = []
     seen: set[str] = set()
-    for match in LINK_RE.finditer(text or ""):
+    unescaped = html.unescape(text or "")
+    for match in LINK_RE.finditer(unescaped):
         raw = match.group(0).rstrip(TRAILING_PUNCTUATION)
+        if "://" not in raw:
+            raw = "https://" + raw
         try:
             query = parse_qs(urlsplit(raw).query, keep_blank_values=True)
             server = query.get("server", [""])[0].strip()
@@ -47,6 +71,121 @@ def extract_proxy_configs(text: str) -> list[str]:
     return configs
 
 
+def normalize_channel_username(channel_id: str) -> str | None:
+    """Extract a public Telegram channel username from @name, name, or t.me URL."""
+    cleaned = channel_id.strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("@"):
+        cleaned = cleaned[1:].strip()
+    elif re.match(r"^(?:https?://)?(?:t\.me|telegram\.me)/", cleaned, re.IGNORECASE):
+        if "://" not in cleaned:
+            cleaned = "https://" + cleaned
+        parts = [part for part in urlsplit(cleaned).path.split("/") if part]
+        if len(parts) >= 2 and parts[0].lower() == "s":
+            cleaned = parts[1]
+        elif parts:
+            cleaned = parts[0]
+        else:
+            return None
+    if USERNAME_RE.match(cleaned):
+        return cleaned
+    return None
+
+
+def parse_web_preview_page(page_html: str, cutoff: datetime) -> tuple[list[str], int | None, bool]:
+    """Parse one t.me/s/<channel> page newest-first.
+
+    Returns (configs, oldest_msg_id_on_page, reached_cutoff).
+    """
+    blocks = [
+        block
+        for block in MESSAGE_BLOCK_SPLIT_RE.split(page_html or "")
+        if "tgme_widget_message" in block and "data-post=" in block
+    ]
+    if not blocks:
+        return [], None, True
+
+    configs: list[str] = []
+    seen: set[str] = set()
+    oldest_id: int | None = None
+    reached_cutoff = False
+
+    # t.me/s renders oldest at the top and newest at the bottom of each page.
+    for block in reversed(blocks):
+        post_match = DATA_POST_RE.search(block)
+        if post_match:
+            msg_id = int(post_match.group(1))
+            if oldest_id is None or msg_id < oldest_id:
+                oldest_id = msg_id
+
+        time_match = DATETIME_RE.search(block)
+        if time_match:
+            try:
+                msg_dt = datetime.fromisoformat(time_match.group(1))
+                if msg_dt.tzinfo is None:
+                    msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+                if msg_dt < cutoff:
+                    reached_cutoff = True
+                    break
+            except ValueError:
+                pass
+
+        for config in extract_proxy_configs(block):
+            if config not in seen:
+                configs.append(config)
+                seen.add(config)
+
+    return configs, oldest_id, reached_cutoff
+
+
+def collect_channel_web_preview(username: str, cutoff: datetime,
+                                session: requests.Session | None = None) -> list[str]:
+    """Collect MTProto proxy configs from https://t.me/s/<username> within cutoff."""
+    http = session or requests.Session()
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    configs: list[str] = []
+    seen: set[str] = set()
+    before_id: int | None = None
+
+    for _ in range(MAX_WEB_PAGES_PER_CHANNEL):
+        url = f"https://t.me/s/{username}"
+        params = {"before": str(before_id)} if before_id is not None else None
+        response = http.get(url, params=params, headers=headers, timeout=30)
+        response.raise_for_status()
+        page_configs, oldest_id, reached_cutoff = parse_web_preview_page(response.text, cutoff)
+        for config in page_configs:
+            if config not in seen:
+                configs.append(config)
+                seen.add(config)
+        if reached_cutoff or oldest_id is None or (before_id is not None and oldest_id >= before_id):
+            break
+        before_id = oldest_id
+
+    return configs
+
+
+def _extract_message_texts(message: object) -> str:
+    parts: list[str] = [getattr(message, "message", None) or ""]
+    for entity in getattr(message, "entities", None) or []:
+        url = getattr(entity, "url", None)
+        if url:
+            parts.append(str(url))
+    reply_markup = getattr(message, "reply_markup", None)
+    for row in getattr(reply_markup, "rows", None) or []:
+        for button in getattr(row, "buttons", None) or []:
+            url = getattr(button, "url", None)
+            if url:
+                parts.append(str(url))
+    return "\n".join(part for part in parts if part)
+
+
 def now_tehran() -> datetime:
     return datetime.now(TEHRAN)
 
@@ -55,40 +194,90 @@ def make_filename(moment: datetime) -> str:
     return f"mtproto-proxies-{moment.astimezone(TEHRAN):%Y-%m-%d_%H-%M-%S}.txt"
 
 
-async def collect(channel_ids: list[str], api_id: int, api_hash: str, session: str,
+async def collect(channel_ids: list[str], api_id: int | None, api_hash: str, session: str,
                   lookback_hours: int) -> list[str]:
-    client = TelegramClient(StringSession(session), api_id, api_hash)
     configs: list[str] = []
     seen: set[str] = set()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    await client.connect()
-    try:
-        if not await client.is_user_authorized():
-            raise RuntimeError("TELEGRAM_SESSION is not authorized; generate a fresh StringSession locally.")
-        for channel_id in channel_ids:
-            entity_arg: int | str
-            try:
-                entity_arg = int(channel_id)
-            except ValueError:
-                entity_arg = channel_id
-            entity = await client.get_entity(entity_arg)
-            # Read newest-first until the 12-hour cutoff; do not cap the message count,
-            # so busy channels are still fully covered for the requested time window.
-            async for message in client.iter_messages(entity):
-                if message.date and message.date < cutoff:
-                    break
-                for config in extract_proxy_configs(message.message or ""):
-                    if config not in seen:
-                        configs.append(config)
-                        seen.add(config)
-    finally:
-        await client.disconnect()
+
+    remaining_channels = list(channel_ids)
+    if api_id and api_hash and session:
+        client: TelegramClient | None = None
+        try:
+            client = TelegramClient(StringSession(session), api_id, api_hash)
+            await client.connect()
+            if await client.is_user_authorized():
+                unresolved: list[str] = []
+                for channel_id in remaining_channels:
+                    username = normalize_channel_username(channel_id)
+                    entity_arg: int | str
+                    if username is not None:
+                        entity_arg = username
+                    else:
+                        try:
+                            entity_arg = int(channel_id)
+                        except ValueError:
+                            entity_arg = channel_id
+                    try:
+                        entity = await client.get_entity(entity_arg)
+                        # Read newest-first until the 12-hour cutoff; do not cap the message count,
+                        # so busy channels are still fully covered for the requested time window.
+                        async for message in client.iter_messages(entity):
+                            if message.date and message.date < cutoff:
+                                break
+                            for config in extract_proxy_configs(_extract_message_texts(message)):
+                                if config not in seen:
+                                    configs.append(config)
+                                    seen.add(config)
+                    except Exception as exc:
+                        if username is not None:
+                            print(
+                                f"Telethon lookup failed for {channel_id} ({exc}); "
+                                "falling back to public web preview."
+                            )
+                            unresolved.append(channel_id)
+                        else:
+                            raise
+                remaining_channels = unresolved
+            else:
+                print(
+                    "TELEGRAM_SESSION is not authorized; falling back to public "
+                    "https://t.me/s/ web preview for public channels."
+                )
+        except Exception as exc:
+            print(
+                f"Telethon session unavailable ({type(exc).__name__}: {exc}); "
+                "falling back to public https://t.me/s/ web preview."
+            )
+        finally:
+            if client is not None:
+                await client.disconnect()
+
+    if remaining_channels:
+        http = requests.Session()
+        for channel_id in remaining_channels:
+            username = normalize_channel_username(channel_id)
+            if username is None:
+                raise RuntimeError(
+                    f"Channel '{channel_id}' is not a public username and TELEGRAM_SESSION is not authorized."
+                )
+            for config in collect_channel_web_preview(username, cutoff, session=http):
+                if config not in seen:
+                    configs.append(config)
+                    seen.add(config)
+
     return configs
+
+
+def _extract_xsrf_from_cookie(cookie: str) -> str:
+    match = re.search(r"(?:^|;\s*)XSRF-TOKEN=([^;]+)", cookie)
+    return unquote(match.group(1).strip()) if match else ""
 
 
 def upload_file(path: Path) -> None:
     cookie = os.environ["UPLOADKON_COOKIE"].strip()
-    xsrf = os.environ["UPLOADKON_XSRF_TOKEN"].strip()
+    raw_xsrf = os.getenv("UPLOADKON_XSRF_TOKEN", "").strip()
+    xsrf = unquote(raw_xsrf) if raw_xsrf else _extract_xsrf_from_cookie(cookie)
     url = os.getenv("UPLOADKON_URL") or DEFAULT_UPLOAD_URL
     fields = {
         "clientMime": "text/plain",
@@ -103,9 +292,13 @@ def upload_file(path: Path) -> None:
         "Cookie": cookie,
         "X-XSRF-TOKEN": xsrf,
         "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
         "Origin": "https://my.uploadkon.ir",
         "Referer": "https://my.uploadkon.ir/drive",
-        "User-Agent": "mtproto-upload GitHub Actions",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
     }
     with path.open("rb") as handle:
         response = requests.post(
@@ -115,7 +308,9 @@ def upload_file(path: Path) -> None:
             files={"file": (path.name, handle, "text/plain")},
             timeout=90,
         )
-    response.raise_for_status()
+    if not response.ok:
+        snippet = response.text[:200].replace("\r", " ").replace("\n", " ")
+        raise RuntimeError(f"UploadKon HTTP {response.status_code}: {snippet}")
     try:
         result = response.json()
     except requests.exceptions.JSONDecodeError as exc:
@@ -123,6 +318,7 @@ def upload_file(path: Path) -> None:
     if not isinstance(result, (dict, list)):
         raise RuntimeError("Upload endpoint returned an unexpected response")
     print("Upload completed successfully.")
+    print("::notice::Upload to UploadKon completed successfully.")
 
 
 def main() -> int:
@@ -134,9 +330,10 @@ def main() -> int:
     if not channel_ids:
         raise RuntimeError("Set CHANNEL_IDS in GitHub Actions variables (comma-separated).")
 
-    api_id = int(os.environ["TELEGRAM_API_ID"].strip())
-    api_hash = os.environ["TELEGRAM_API_HASH"].strip()
-    session = os.environ["TELEGRAM_SESSION"].strip()
+    raw_api_id = os.getenv("TELEGRAM_API_ID", "").strip()
+    api_id = int(raw_api_id) if raw_api_id else None
+    api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
+    session = os.getenv("TELEGRAM_SESSION", "").strip()
     lookback = int(os.getenv("LOOKBACK_HOURS", str(DEFAULT_LOOKBACK_HOURS)).strip())
     if lookback < 1:
         raise ValueError("LOOKBACK_HOURS must be a positive integer")
