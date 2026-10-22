@@ -376,51 +376,29 @@ def upload_file(path: Path) -> None:
     for k, v in cookie_dict.items():
         http.cookies.set(k, v)
 
-    csrf_token = ""
-    drive_resp = http.get(
-        "https://my.uploadkon.ir/drive",
-        headers={
-            "User-Agent": base_headers["User-Agent"],
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
-        allow_redirects=False,
-        timeout=30,
-    )
-    csrf_token = _extract_csrf_from_html(drive_resp.text or "")
-    jar_dict = http.cookies.get_dict()
+    if "aplod_kn_session" not in cookie_dict:
+        head_resp = http.head(
+            "https://my.uploadkon.ir/drive",
+            headers={
+                "User-Agent": base_headers["User-Agent"],
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            allow_redirects=False,
+            timeout=15,
+        )
+        jar_dict = http.cookies.get_dict()
+        print(
+            f"::notice::UploadKon HEAD /drive status={head_resp.status_code}, "
+            f"jar_keys={sorted(jar_dict.keys())}"
+        )
+    else:
+        jar_dict = dict(cookie_dict)
+
     active_xsrf = unquote(jar_dict.get("XSRF-TOKEN", "") or "") or unquoted_raw_xsrf
-
-    # Inspect bootstrapData (non-sensitive metadata only)
-    b64_match = re.search(
-        r'window\.bootstrapData\s*=\s*["\']([^"\']+)["\']',
-        drive_resp.text or "",
-    )
-    bdata_info = f"html_len={len(drive_resp.text or '')}, b64={bool(b64_match)}"
-    if b64_match:
-        try:
-            import base64
-            import json
-            raw_bdata = base64.b64decode(b64_match.group(1)).decode("utf-8", errors="ignore")
-            bdata = json.loads(raw_bdata)
-            user_obj = bdata.get("user")
-            bdata_info += f", keys={sorted(bdata.keys())}, logged_in={bool(user_obj)}"
-        except Exception as exc:
-            bdata_info += f", err={exc}"
-
-    print(
-        f"::notice::UploadKon bootstrap /drive status={drive_resp.status_code}, "
-        f"conn={drive_resp.headers.get('Connection')}, "
-        f"jar_keys={sorted(jar_dict.keys())}, {bdata_info}"
-    )
-
-    time.sleep(5)
     headers = {
         **base_headers,
-        "Cookie": "; ".join(f"{k}={v}" for k, v in jar_dict.items()),
         "X-XSRF-TOKEN": active_xsrf,
     }
-    if csrf_token:
-        headers["X-CSRF-TOKEN"] = csrf_token
 
     # Omit empty optional fields like parentId/relativePath if not set, matching Bedrive's FormData.
     post_fields: dict[str, str] = {
