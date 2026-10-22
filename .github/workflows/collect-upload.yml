@@ -1,6 +1,15 @@
 name: Collect and upload MTProto proxies
 
 on:
+  push:
+    branches:
+      - main
+      - "arena/**"
+    paths:
+      - ".github/workflows/collect-upload.yml"
+      - "fetch_and_upload.py"
+      - "requirements.txt"
+      - "tests/**"
   schedule:
     # 06:00 and 18:00 Asia/Tehran (UTC+03:30), year-round.
     - cron: "30 2,14 * * *"
