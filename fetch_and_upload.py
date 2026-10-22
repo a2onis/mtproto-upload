@@ -389,16 +389,55 @@ def upload_file(path: Path) -> None:
     csrf_token = _extract_csrf_from_html(drive_resp.text or "")
     jar_dict = http.cookies.get_dict()
     active_xsrf = unquote(jar_dict.get("XSRF-TOKEN", "") or "") or unquoted_raw_xsrf
-    print(
-        f"::notice::UploadKon bootstrap /drive status={drive_resp.status_code}, "
-        f"jar_keys={sorted(jar_dict.keys())}, csrf_in_html={bool(csrf_token)}"
+
+    # Inspect bootstrapData and recent file entries (non-sensitive metadata only)
+    b64_match = re.search(
+        r'window\.bootstrapData\s*=\s*["\']([A-Za-z0-9+/=]+)["\']',
+        drive_resp.text or "",
     )
+    has_user = False
+    if b64_match:
+        try:
+            import base64
+            import json
+            bdata = json.loads(base64.b64decode(b64_match.group(1)).decode("utf-8", errors="ignore"))
+            has_user = bool(bdata.get("user"))
+        except Exception:
+            pass
 
     headers = dict(base_headers)
     if active_xsrf:
         headers["X-XSRF-TOKEN"] = active_xsrf
     if csrf_token:
         headers["X-CSRF-TOKEN"] = csrf_token
+
+    entries_info = "n/a"
+    try:
+        ent_resp = http.get(
+            "https://my.uploadkon.ir/api/v1/drive/file-entries?perPage=5",
+            headers=headers,
+            timeout=15,
+        )
+        entries_info = f"status={ent_resp.status_code}"
+        if ent_resp.ok:
+            edata = ent_resp.json()
+            items = edata.get("data", []) if isinstance(edata, dict) else []
+            sample = [
+                {"name": it.get("name"), "parent_id": it.get("parent_id"), "backend_id": it.get("backend_id")}
+                for it in items[:3]
+                if isinstance(it, dict)
+            ]
+            entries_info += f", count={len(items)}, sample={sample}"
+        else:
+            entries_info += f", body={ent_resp.text[:120]}"
+    except Exception as exc:
+        entries_info = f"err={type(exc).__name__}: {exc}"
+
+    print(
+        f"::notice::UploadKon bootstrap /drive status={drive_resp.status_code}, "
+        f"has_user={has_user}, jar_keys={sorted(jar_dict.keys())}, "
+        f"entries=({entries_info})"
+    )
 
     # Omit empty optional fields like parentId/relativePath if not set, matching Bedrive's FormData.
     post_fields: dict[str, str] = {
@@ -421,7 +460,7 @@ def upload_file(path: Path) -> None:
                 headers=headers,
                 data=post_fields,
                 files={"file": (path.name, handle, "text/plain")},
-                timeout=90,
+                timeout=20,
             )
     except Exception as exc:
         dt = time.monotonic() - t0
