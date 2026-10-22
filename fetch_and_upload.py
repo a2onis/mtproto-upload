@@ -392,24 +392,43 @@ def upload_file(path: Path) -> None:
         f"cookies={sorted(cookie_dict.keys())}"
     )
 
+    # Test A: GET with ONLY aplod_kn_session + XSRF-TOKEN (no remember_web)
+    session_only_cookies = {k: v for k, v in cookie_dict.items() if not k.startswith("remember_web")}
+    session_only_str = "; ".join(f"{k}={v}" for k, v in session_only_cookies.items())
+    t_a = time.monotonic()
+    try:
+        ra = requests.get(
+            "https://my.uploadkon.ir/api/v1/drive/file-entries?perPage=1",
+            headers={**base_headers, "Cookie": session_only_str, "X-XSRF-TOKEN": active_xsrf, "Connection": "close"},
+            timeout=8,
+        )
+        print(f"::notice::TestA (session-only) status={ra.status_code} in {time.monotonic() - t_a:.2f}s")
+    except Exception as exc:
+        print(f"::notice::TestA (session-only) failed after {time.monotonic() - t_a:.2f}s: {type(exc).__name__}")
+
+    # Test B: GET with NO cookies (tests if IP itself is throttled for 60s)
+    t_b = time.monotonic()
+    try:
+        rb = requests.get(
+            "https://my.uploadkon.ir/login",
+            headers={"User-Agent": base_headers["User-Agent"], "Connection": "close"},
+            timeout=8,
+        )
+        print(f"::notice::TestB (no-cookie /login) status={rb.status_code} in {time.monotonic() - t_b:.2f}s")
+    except Exception as exc:
+        print(f"::notice::TestB (no-cookie /login) failed after {time.monotonic() - t_b:.2f}s: {type(exc).__name__}")
+
+    # Wait until 62s after Req1 if needed, then POST
+    elapsed_since_req1 = time.monotonic() - t_get
+    if elapsed_since_req1 < 62:
+        time.sleep(62 - elapsed_since_req1)
+
     headers = {
         **base_headers,
         "Cookie": merged_cookie_str,
         "X-XSRF-TOKEN": active_xsrf,
         "Connection": "close",
     }
-
-    # Request 2: verify authenticated session cookie works on a fast GET
-    t_get2 = time.monotonic()
-    try:
-        ent_resp2 = requests.get(
-            "https://my.uploadkon.ir/api/v1/drive/file-entries?perPage=1",
-            headers=headers,
-            timeout=10,
-        )
-        print(f"::notice::Req2 GET with session status={ent_resp2.status_code} in {time.monotonic() - t_get2:.2f}s")
-    except Exception as exc:
-        print(f"::notice::Req2 GET with session failed after {time.monotonic() - t_get2:.2f}s: {type(exc).__name__}")
 
     # Omit empty optional fields like parentId/relativePath if not set, matching Bedrive's FormData.
     post_fields: dict[str, str] = {
