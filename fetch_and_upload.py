@@ -126,14 +126,18 @@ def upload_file(path: Path) -> None:
 
 
 def main() -> int:
-    channel_ids = [item.strip() for item in os.getenv("CHANNEL_IDS", "").split(",") if item.strip()]
+    channel_ids = [
+        item.strip()
+        for item in re.split(r"[,\s]+", os.getenv("CHANNEL_IDS", ""))
+        if item.strip()
+    ]
     if not channel_ids:
         raise RuntimeError("Set CHANNEL_IDS in GitHub Actions variables (comma-separated).")
 
-    api_id = int(os.environ["TELEGRAM_API_ID"])
-    api_hash = os.environ["TELEGRAM_API_HASH"]
-    session = os.environ["TELEGRAM_SESSION"]
-    lookback = int(os.getenv("LOOKBACK_HOURS", str(DEFAULT_LOOKBACK_HOURS)))
+    api_id = int(os.environ["TELEGRAM_API_ID"].strip())
+    api_hash = os.environ["TELEGRAM_API_HASH"].strip()
+    session = os.environ["TELEGRAM_SESSION"].strip()
+    lookback = int(os.getenv("LOOKBACK_HOURS", str(DEFAULT_LOOKBACK_HOURS)).strip())
     if lookback < 1:
         raise ValueError("LOOKBACK_HOURS must be a positive integer")
 
@@ -142,7 +146,9 @@ def main() -> int:
     import asyncio
     configs = asyncio.run(collect(channel_ids, api_id, api_hash, session, lookback))
     output.write_text("\n".join(configs) + ("\n" if configs else ""), encoding="utf-8")
-    print(f"Wrote {len(configs)} unique MTProto proxy config(s) to {output.name}.")
+    msg = f"Wrote {len(configs)} unique MTProto proxy config(s) to {output.name}."
+    print(msg)
+    print(f"::notice::{msg}")
     if not configs:
         print("No valid proxy links were found; skipping the upload.")
         return 0
@@ -155,5 +161,7 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:
         # Keep diagnostics useful without exposing credential values.
-        print(f"ERROR: {exc}", file=sys.stderr)
+        err_msg = f"{type(exc).__name__}: {exc}".replace("\r", " ").replace("\n", " ")
+        print(f"ERROR: {err_msg}", file=sys.stderr)
+        print(f"::error::{err_msg}", file=sys.stderr)
         raise SystemExit(1)
