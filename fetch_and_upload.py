@@ -371,11 +371,21 @@ def upload_file(path: Path) -> None:
     # Bootstrap/refresh session and XSRF-TOKEN from /drive first (essential when
     # UPLOADKON_COOKIE only contains a long-lived remember_web_* cookie or when
     # the 2-hour laravel_session has rotated).
+    import socket
     import time
+    from urllib3.connection import HTTPConnection
+    if hasattr(socket, "TCP_MAXSEG"):
+        mss_opt = (socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1000)
+        if mss_opt not in HTTPConnection.default_socket_options:
+            HTTPConnection.default_socket_options = [
+                *HTTPConnection.default_socket_options,
+                mss_opt,
+            ]
+
     # Request 1: bootstrap session + XSRF-TOKEN via lightweight JSON API call
     t_get = time.monotonic()
     ent_resp = requests.get(
-        "https://my.uploadkon.ir/api/v1/drive/file-entries?perPage=5",
+        "https://my.uploadkon.ir/api/v1/drive/file-entries?perPage=1",
         headers={
             **base_headers,
             "Cookie": cookie,
@@ -385,63 +395,24 @@ def upload_file(path: Path) -> None:
     )
     dt_get = time.monotonic() - t_get
     cookie_dict.update(ent_resp.cookies.get_dict())
-    merged_cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
     active_xsrf = unquote(cookie_dict.get("XSRF-TOKEN", "") or "") or unquoted_raw_xsrf
     print(
         f"::notice::Req1 GET status={ent_resp.status_code} in {dt_get:.2f}s, "
         f"cookies={sorted(cookie_dict.keys())}"
     )
 
-    # Test A: GET with ONLY aplod_kn_session + XSRF-TOKEN (no remember_web)
-    session_only_cookies = {k: v for k, v in cookie_dict.items() if not k.startswith("remember_web")}
-    session_only_str = "; ".join(f"{k}={v}" for k, v in session_only_cookies.items())
-    t_a = time.monotonic()
-    try:
-        ra = requests.get(
-            "https://my.uploadkon.ir/api/v1/drive/file-entries?perPage=1",
-            headers={**base_headers, "Cookie": session_only_str, "X-XSRF-TOKEN": active_xsrf, "Connection": "close"},
-            timeout=8,
-        )
-        print(f"::notice::TestA (session-only) status={ra.status_code} in {time.monotonic() - t_a:.2f}s")
-    except Exception as exc:
-        print(f"::notice::TestA (session-only) failed after {time.monotonic() - t_a:.2f}s: {type(exc).__name__}")
-
-    # Test B: GET with NO cookies (tests if IP itself is throttled for 60s)
-    t_b = time.monotonic()
-    try:
-        rb = requests.get(
-            "https://my.uploadkon.ir/login",
-            headers={"User-Agent": base_headers["User-Agent"], "Connection": "close"},
-            timeout=8,
-        )
-        print(f"::notice::TestB (no-cookie /login) status={rb.status_code} in {time.monotonic() - t_b:.2f}s")
-    except Exception as exc:
-        print(f"::notice::TestB (no-cookie /login) failed after {time.monotonic() - t_b:.2f}s: {type(exc).__name__}")
-
-    # Wait until 62s after Req1 if needed, then POST
-    elapsed_since_req1 = time.monotonic() - t_get
-    if elapsed_since_req1 < 62:
-        time.sleep(62 - elapsed_since_req1)
+    # Keep Cookie header compact (Laravel only needs aplod_kn_session in Cookie and X-XSRF-TOKEN in header)
+    if "aplod_kn_session" in cookie_dict:
+        post_cookie_str = f"aplod_kn_session={cookie_dict['aplod_kn_session']}"
+    else:
+        post_cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
 
     headers = {
         **base_headers,
-        "Cookie": merged_cookie_str,
+        "Cookie": post_cookie_str,
         "X-XSRF-TOKEN": active_xsrf,
         "Connection": "close",
     }
-
-    # Omit empty optional fields like parentId/relativePath if not set, matching Bedrive's FormData.
-    post_fields: dict[str, str] = {
-        "clientMime": "text/plain",
-        "clientExtension": "txt",
-        "uploadType": os.getenv("UPLOADKON_UPLOAD_TYPE") or "bedrive",
-        "backendId": os.getenv("UPLOADKON_BACKEND_ID") or "cdc_W8Ekm8",
-        "workspaceId": os.getenv("UPLOADKON_WORKSPACE_ID") or "0",
-    }
-    if os.getenv("UPLOADKON_PARENT_ID"):
-        post_fields["parentId"] = os.environ["UPLOADKON_PARENT_ID"]
-    if os.getenv("UPLOADKON_RELATIVE_PATH"):
-        post_fields["relativePath"] = os.environ["UPLOADKON_RELATIVE_PATH"]
 
     t0 = time.monotonic()
     try:
@@ -449,7 +420,7 @@ def upload_file(path: Path) -> None:
             response = requests.post(
                 url,
                 headers=headers,
-                data=post_fields,
+                data=fields,
                 files={"file": (path.name, handle, "text/plain")},
                 timeout=30,
             )
@@ -461,14 +432,6 @@ def upload_file(path: Path) -> None:
     if not response.ok:
         snippet = response.text[:200].replace("\r", " ").replace("\n", " ")
         raise RuntimeError(f"UploadKon HTTP {response.status_code}: {snippet}")
-    try:
-        result = response.json()
-    except requests.exceptions.JSONDecodeError as exc:
-        raise RuntimeError("Upload endpoint did not return JSON") from exc
-    if not isinstance(result, (dict, list)):
-        raise RuntimeError("Upload endpoint returned an unexpected response")
-    print("Upload completed successfully.")
-    print("::notice::Upload to UploadKon completed successfully.")
     try:
         result = response.json()
     except requests.exceptions.JSONDecodeError as exc:
