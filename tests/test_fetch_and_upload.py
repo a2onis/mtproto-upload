@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from fetch_and_upload import extract_proxy_configs, make_filename
+from fetch_and_upload import DEFAULT_LOOKBACK_HOURS, extract_proxy_configs, make_filename
 
 
 class ProxyExtractionTests(unittest.TestCase):
@@ -27,6 +27,11 @@ class ProxyExtractionTests(unittest.TestCase):
     def test_keeps_distinct_configs(self):
         text = "tg://proxy?server=a&port=80&secret=x tg://proxy?server=b&port=443&secret=y"
         self.assertEqual(len(extract_proxy_configs(text)), 2)
+
+
+class LookbackTests(unittest.TestCase):
+    def test_default_lookback_is_twelve_hours(self):
+        self.assertEqual(DEFAULT_LOOKBACK_HOURS, 12)
 
 
 class FilenameTests(unittest.TestCase):

@@ -38,7 +38,7 @@ UploadKon's browser session credentials expire and may need to be refreshed. Rot
 
 ## Output behavior
 
-Files are named `mtproto-proxies-YYYY-MM-DD_HH-MM-SS.txt`, with the timestamp in `Asia/Tehran`. The job searches the previous 24 hours to tolerate delayed scheduled runs (so consecutive files can contain some of the same links), scans at most the newest 2,000 messages per channel, and deduplicates links within each output file. GitHub Actions scheduled runs can be delayed during busy periods. It recognizes `tg://proxy?...` and `t.me/proxy?...` / `telegram.me/proxy?...` links containing `server`, `port`, and `secret`. If no valid configs are found, an empty local file is created and upload is skipped. Files are created on the ephemeral Actions runner and are not committed to the repository.
+Files are named `mtproto-proxies-YYYY-MM-DD_HH-MM-SS.txt`, with the timestamp in `Asia/Tehran`. For each channel, the job reads newest-first and processes messages from the previous 12 hours, stopping at the cutoff; it does not cap the number of messages within that window. It deduplicates links within each output file. GitHub Actions scheduled runs can be delayed, so a delay longer than the 12-hour lookback may leave a gap. It recognizes `tg://proxy?...` and `t.me/proxy?...` / `telegram.me/proxy?...` links containing `server`, `port`, and `secret`. If no valid configs are found, an empty local file is created and upload is skipped. Files are created on the ephemeral Actions runner and are not committed to the repository.
 
 ## Local checks
 

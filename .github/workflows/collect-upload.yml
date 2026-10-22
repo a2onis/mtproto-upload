@@ -25,7 +25,7 @@ jobs:
       UPLOADKON_PARENT_ID: ${{ vars.UPLOADKON_PARENT_ID }}
       UPLOADKON_WORKSPACE_ID: ${{ vars.UPLOADKON_WORKSPACE_ID }}
       UPLOADKON_UPLOAD_TYPE: ${{ vars.UPLOADKON_UPLOAD_TYPE }}
-      LOOKBACK_HOURS: "24"
+      LOOKBACK_HOURS: "12"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

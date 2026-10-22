@@ -16,6 +16,7 @@ from telethon.sessions import StringSession
 
 TEHRAN = ZoneInfo("Asia/Tehran")
 DEFAULT_UPLOAD_URL = "https://my.uploadkon.ir/api/v1/file-entries"
+DEFAULT_LOOKBACK_HOURS = 12
 # Telegram proxy links are commonly shared as tg://proxy or t.me/proxy URLs.
 LINK_RE = re.compile(r"(?:tg://proxy|https?://(?:t\.me|telegram\.me)/proxy)\?[^\s<>\"'`]+", re.IGNORECASE)
 TRAILING_PUNCTUATION = ").,;!?]}»'\""
@@ -71,9 +72,9 @@ async def collect(channel_ids: list[str], api_id: int, api_hash: str, session: s
             except ValueError:
                 entity_arg = channel_id
             entity = await client.get_entity(entity_arg)
-            # Limit protects the scheduled job from unexpectedly large channels; recent
-            # messages are returned first and the lookback window covers delayed runs.
-            async for message in client.iter_messages(entity, limit=2000):
+            # Read newest-first until the 12-hour cutoff; do not cap the message count,
+            # so busy channels are still fully covered for the requested time window.
+            async for message in client.iter_messages(entity):
                 if message.date and message.date < cutoff:
                     break
                 for config in extract_proxy_configs(message.message or ""):
@@ -132,7 +133,7 @@ def main() -> int:
     api_id = int(os.environ["TELEGRAM_API_ID"])
     api_hash = os.environ["TELEGRAM_API_HASH"]
     session = os.environ["TELEGRAM_SESSION"]
-    lookback = int(os.getenv("LOOKBACK_HOURS", "24"))
+    lookback = int(os.getenv("LOOKBACK_HOURS", str(DEFAULT_LOOKBACK_HOURS)))
     if lookback < 1:
         raise ValueError("LOOKBACK_HOURS must be a positive integer")
 
