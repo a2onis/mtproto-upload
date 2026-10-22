@@ -372,31 +372,42 @@ def upload_file(path: Path) -> None:
     # UPLOADKON_COOKIE only contains a long-lived remember_web_* cookie or when
     # the 2-hour laravel_session has rotated).
     import time
-    http = requests.Session()
-    for k, v in cookie_dict.items():
-        http.cookies.set(k, v)
-
-    if "aplod_kn_session" not in cookie_dict:
-        head_resp = http.head(
-            "https://my.uploadkon.ir/drive",
+    # Test GET /api/v1/drive/file-entries as Request #1
+    t_get = time.monotonic()
+    try:
+        ent_resp = requests.get(
+            "https://my.uploadkon.ir/api/v1/drive/file-entries?perPage=5",
             headers={
-                "User-Agent": base_headers["User-Agent"],
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                **base_headers,
+                "Cookie": cookie,
             },
-            allow_redirects=False,
             timeout=15,
         )
-        jar_dict = http.cookies.get_dict()
+        dt_get = time.monotonic() - t_get
+        set_keys = sorted(ent_resp.cookies.get_dict().keys())
+        sample_names: list[str] = []
+        if ent_resp.ok:
+            try:
+                edata = ent_resp.json()
+                items = edata.get("data", []) if isinstance(edata, dict) else []
+                sample_names = [str(it.get("name")) for it in items[:5] if isinstance(it, dict)]
+            except Exception:
+                pass
         print(
-            f"::notice::UploadKon HEAD /drive status={head_resp.status_code}, "
-            f"jar_keys={sorted(jar_dict.keys())}"
+            f"::notice::Req1 GET /api/v1/drive/file-entries status={ent_resp.status_code} "
+            f"in {dt_get:.2f}s, set_cookies={set_keys}, files={sample_names}, "
+            f"body={ent_resp.text[:120].replace(chr(10), ' ')}"
         )
-    else:
-        jar_dict = dict(cookie_dict)
+        cookie_dict.update(ent_resp.cookies.get_dict())
+    except Exception as exc:
+        dt_get = time.monotonic() - t_get
+        print(f"::notice::Req1 GET /api/v1/drive/file-entries failed after {dt_get:.2f}s: {type(exc).__name__}: {exc}")
 
-    active_xsrf = unquote(jar_dict.get("XSRF-TOKEN", "") or "") or unquoted_raw_xsrf
+    merged_cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
+    active_xsrf = unquote(cookie_dict.get("XSRF-TOKEN", "") or "") or unquoted_raw_xsrf
     headers = {
         **base_headers,
+        "Cookie": merged_cookie_str,
         "X-XSRF-TOKEN": active_xsrf,
     }
 
