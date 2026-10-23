@@ -1,0 +1,119 @@
+name: UploadKon connectivity probe (temporary)
+
+on:
+  push:
+    paths:
+      - ".github/workflows/upload-debug.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install requests
+        run: python -m pip install --disable-pip-version-check "requests>=2.32,<3"
+      - name: Probe upload endpoints
+        env:
+          UPLOADKON_COOKIE: ${{ secrets.UPLOADKON_COOKIE }}
+          UPLOADKON_XSRF_TOKEN: ${{ secrets.UPLOADKON_XSRF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os, socket, sys, time
+          import requests
+
+          UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+          payload = b"tg://proxy?server=probe.example&port=443&secret=deadbeef\n"
+
+          def show(label, response, elapsed, body=True):
+              print(f"[{label}] HTTP {response.status_code} in {elapsed:.2f}s "
+                    f"content-type={response.headers.get('Content-Type')}")
+              for key in ("server", "cf-ray", "via", "x-powered-by", "content-length"):
+                  if key in response.headers:
+                      print(f"    {key}: {response.headers[key]}")
+              if body:
+                  print("    body:", response.text[:300].replace("\n", " "))
+
+          def probe(name, method, url, **kwargs):
+              started = time.time()
+              try:
+                  session = requests.Session()
+                  if method == "GET":
+                      response = session.get(url, timeout=(20, 60), **kwargs)
+                  else:
+                      response = session.post(url, timeout=(20, 60), **kwargs)
+                  show(name, response, time.time() - started)
+                  return session
+              except Exception as exc:
+                  print(f"[{name}] FAILED after {time.time() - started:.2f}s: "
+                        f"{type(exc).__name__}: {exc}")
+                  return None
+
+          print("DNS:", socket.gethostbyname_ex("uploadkon.ir"))
+          print("DNS my:", socket.gethostbyname_ex("my.uploadkon.ir"))
+
+          headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
+          page = probe("GET uploadkon.ir", "GET", "https://uploadkon.ir/",
+                       headers={**headers, "Accept": "text/html"}, allow_redirects=True)
+
+          ajax = {
+              "User-Agent": UA,
+              "Accept": "*/*",
+              "Accept-Language": "en-US,en;q=0.9",
+              "X-Requested-With": "XMLHttpRequest",
+              "Origin": "https://uploadkon.ir",
+              "Referer": "https://uploadkon.ir/",
+              "Connection": "close",
+          }
+          probe("POST uploadkon.ir (tiny)",
+                "POST", "https://uploadkon.ir/",
+                headers=ajax,
+                data={"submitr": "1", "ajax": "1"},
+                files={"file": ("probe.txt", payload, "text/plain")})
+
+          # Same request but through the warmed session (with whatever cookies the
+          # homepage set), which is what a browser would do.
+          if page is not None:
+              started = time.time()
+              try:
+                  response = page.post(
+                      "https://uploadkon.ir/", headers=ajax,
+                      data={"submitr": "1", "ajax": "1"},
+                      files={"file": ("probe2.txt", payload, "text/plain")},
+                      timeout=(20, 60))
+                  show("POST uploadkon.ir (warmed)", response, time.time() - started)
+                  print("    cookies:", page.cookies.get_dict())
+              except Exception as exc:
+                  print(f"[POST warmed] FAILED after {time.time() - started:.2f}s: "
+                        f"{type(exc).__name__}: {exc}")
+                  print("    cookies:", page.cookies.get_dict())
+
+          cookie = (os.getenv("UPLOADKON_COOKIE") or "").strip()
+          xsrf = (os.getenv("UPLOADKON_XSRF_TOKEN") or "").strip()
+          if cookie:
+              base = {"User-Agent": UA, "Accept": "application/json",
+                      "X-Requested-With": "XMLHttpRequest",
+                      "Origin": "https://my.uploadkon.ir",
+                      "Referer": "https://my.uploadkon.ir/drive"}
+              probe("GET my.uploadkon.ir drive",
+                    "GET", "https://my.uploadkon.ir/api/v1/drive/file-entries",
+                    headers={**base, "Cookie": cookie}, params={"perPage": 1})
+              probe("POST my.uploadkon.ir upload",
+                    "POST", "https://my.uploadkon.ir/api/v1/file-entries",
+                    headers={**base, "Cookie": cookie, "X-XSRF-TOKEN": xsrf,
+                             "Connection": "close"},
+                    data={"clientMime": "text/plain", "clientExtension": "txt",
+                          "uploadType": "bedrive", "backendId": "cdc_W8Ekm8",
+                          "parentId": "", "workspaceId": "0", "relativePath": ""},
+                    files={"file": ("probe3.txt", payload, "text/plain")})
+          else:
+              print("No UPLOADKON_COOKIE secret; skipping the drive API probes.")
+          PY
