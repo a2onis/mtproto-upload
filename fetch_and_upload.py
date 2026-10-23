@@ -820,6 +820,41 @@ def _upload_target_once(target: str, path: Path, timeout: float) -> object:
     return _public_upload_once(path, timeout) if target == "public" else _upload_once(path, timeout)
 
 
+def verify_public_link(url: str, timeout: float = 60.0) -> bool:
+    """Fetch the returned link once so a broken upload is not reported as success."""
+    session = requests.Session()
+    try:
+        _configure_session(session)
+        response = session.get(
+            url,
+            headers={"User-Agent": _public_upload_headers()["User-Agent"], "Accept": "*/*"},
+            timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), min(timeout, 60.0)),
+            stream=True,
+        )
+        with response:
+            status = response.status_code
+            content_type = response.headers.get("Content-Type", "unknown")
+            length = response.headers.get("Content-Length", "unknown")
+    except requests.exceptions.RequestException as exc:
+        message = (f"Could not verify the uploaded link {url}: "
+                   f"{type(exc).__name__}: {_one_line(exc)}")
+        print(message, file=sys.stderr)
+        print(f"::warning::{message}", file=sys.stderr)
+        return False
+    finally:
+        session.close()
+
+    if status == 200:
+        message = f"Verified uploaded link: HTTP 200, {content_type}, {length} bytes"
+        print(message)
+        print(f"::notice::{message}")
+        return True
+    message = f"Uploaded link returned HTTP {status}: {url}"
+    print(message, file=sys.stderr)
+    print(f"::warning::{message}", file=sys.stderr)
+    return False
+
+
 def _report_upload_success(target: str, result: object) -> None:
     print(f"Upload to UploadKon ({target}) completed successfully.")
     if target == "public" and isinstance(result, dict):
@@ -884,6 +919,10 @@ def _try_upload_target(target: str, path: Path, attempts: int, timeout: float,
             continue
 
         _report_upload_success(target, result)
+        if target == "public" and isinstance(result, dict):
+            link = result.get("direct_url", "")
+            if link:
+                verify_public_link(link, timeout)
         return
 
     raise RuntimeError(

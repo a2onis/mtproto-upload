@@ -110,6 +110,13 @@ class _FakeResponse:
         self._payload = payload
         self.text = text or ("{}" if payload is not None else "")
         self.cookies = requests.cookies.RequestsCookieJar()
+        self.headers: dict[str, str] = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
 
     def json(self):
         if self._payload is None:
@@ -488,3 +495,36 @@ class UploadBudgetTests(unittest.TestCase):
             # The 15s budget must end the loop long before 50 attempts.
             self.assertLess(elapsed, 15)
             self.assertLess(session.post.call_count, 50)
+
+
+@unittest.skipUnless(HAS_REQUESTS, "requests is not installed")
+class LinkVerificationTests(unittest.TestCase):
+    def _session(self, response):
+        from unittest import mock
+
+        session = mock.MagicMock()
+        session.get.return_value = response
+        return session
+
+    def test_ok_link_is_verified(self):
+        from unittest import mock
+
+        from fetch_and_upload import verify_public_link
+
+        response = _FakeResponse(200, text="zipbytes")
+        response.headers = {"Content-Type": "application/zip", "Content-Length": "9"}
+        with mock.patch("fetch_and_upload.requests.Session",
+                        return_value=self._session(response)):
+            self.assertTrue(verify_public_link("https://uploadkon.ir/uploads/x.zip"))
+
+    def test_broken_link_warns_without_raising(self):
+        import requests as requests_module
+        from unittest import mock
+
+        from fetch_and_upload import verify_public_link
+
+        session = mock.MagicMock()
+        session.get.side_effect = requests_module.exceptions.ReadTimeout("slow")
+        with mock.patch("fetch_and_upload.requests.Session", return_value=session), \
+                mock.patch("builtins.print"):
+            self.assertFalse(verify_public_link("https://uploadkon.ir/uploads/x.zip"))

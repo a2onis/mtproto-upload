@@ -64,6 +64,7 @@ Per endpoint, the uploader:
 - stays inside an overall `UPLOADKON_TOTAL_TIMEOUT` budget (default 600 s) so retries never outlast the job;
 - fails fast for permanent errors such as `400`/`419` or a rejection with no file link, then moves on to the next endpoint;
 - rebuilds the upload payload for every attempt so a retry always sends the full body;
+- fetches the returned public link once to confirm it really downloads (a broken link becomes a warning, not a false success);
 - optionally routes through a proxy (`UPLOADKON_PROXY`, e.g. `http://user:pass@host:8080`) if the runner IP is blocked.
 
 If every attempt at every endpoint fails, the job fails with the collected error details, but the proxy list is always kept as the `mtproto-proxies` workflow artifact. A retry after a read timeout can occasionally create a duplicate file on UploadKon, since the server may have received the first request.
