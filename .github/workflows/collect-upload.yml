@@ -31,6 +31,8 @@ jobs:
       # account API, auto = try public first and fall back to drive when a cookie exists.
       UPLOADKON_MODE: ${{ vars.UPLOADKON_MODE || 'auto' }}
       UPLOADKON_PUBLIC_URL: ${{ vars.UPLOADKON_PUBLIC_URL }}
+      # The anonymous endpoint rejects .txt, so the list is uploaded as a .zip.
+      UPLOADKON_PUBLIC_ARCHIVE: ${{ vars.UPLOADKON_PUBLIC_ARCHIVE || '1' }}
       UPLOADKON_COOKIE: ${{ secrets.UPLOADKON_COOKIE }}
       UPLOADKON_XSRF_TOKEN: ${{ secrets.UPLOADKON_XSRF_TOKEN }}
       UPLOADKON_URL: ${{ vars.UPLOADKON_URL }}

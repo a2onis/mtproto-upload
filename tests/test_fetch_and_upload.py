@@ -334,11 +334,44 @@ class PublicResponseParsingTests(unittest.TestCase):
         with self.assertRaises(PermanentUploadError):
             parse_public_upload_response('[{"status": false, "message": "file too large"}]')
 
+    def test_unsupported_extension_rejection_is_reported(self):
+        from fetch_and_upload import PermanentUploadError, parse_public_upload_response
+
+        payload = (
+            '[{"t": "index_err", "i": "پسوند \\"txt\\" پشتیبانی نمی‌شود!<br> '
+            '<a href=\\"ucp.php?go=register\\">عضویت</a>", '
+            '"message_content": "<div>rejected</div>"}]'
+        )
+        with self.assertRaises(PermanentUploadError) as ctx:
+            parse_public_upload_response(payload)
+        message = str(ctx.exception)
+        self.assertIn("txt", message)
+        self.assertIn("پشتیبانی نمی‌شود", message)
+
     def test_non_json_reply_is_retryable(self):
         from fetch_and_upload import RetryableUploadError, parse_public_upload_response
 
         with self.assertRaises(RetryableUploadError):
             parse_public_upload_response("<html>502 Bad Gateway</html>")
+
+
+class ArchiveTests(unittest.TestCase):
+    def test_archive_contains_the_proxy_list(self):
+        import tempfile
+        import zipfile
+        from pathlib import Path
+
+        from fetch_and_upload import build_archive
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mtproto-proxies-2026-10-23_12-00-00.txt"
+            path.write_text("tg://proxy?server=a&port=443&secret=b\n", encoding="utf-8")
+            data, archive_name = build_archive(path)
+
+        self.assertEqual(archive_name, path.name + ".zip")
+        with zipfile.ZipFile(__import__("io").BytesIO(data)) as archive:
+            self.assertEqual(archive.namelist(), [path.name])
+            self.assertIn("tg://proxy", archive.read(path.name).decode())
 
 
 @unittest.skipUnless(HAS_REQUESTS, "requests is not installed")

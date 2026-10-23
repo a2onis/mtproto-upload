@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import html
+import io
 import json
 import os
 import re
 import sys
 import time
+import zipfile
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -546,11 +548,30 @@ def extract_textarea_values(html_fragment: str) -> dict[str, str]:
     return {key: html.unescape(value) for key, value in parser.values.items()}
 
 
+def _public_rejection_message(payload: object) -> str:
+    """Extract the human-readable rejection text from an uploadkon.ir reply."""
+    items = payload if isinstance(payload, list) else [payload]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        fragment = item.get("i") or item.get("message_content") or ""
+        if not isinstance(fragment, str):
+            continue
+        text = re.sub(r"<br\s*/?>", " ", fragment, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = html.unescape(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            return text[:300]
+    return "no file link in the response"
+
+
 def parse_public_upload_response(response_text: str) -> dict[str, str]:
     """Parse the anonymous uploadkon.ir AJAX reply into direct/delete links.
 
     The endpoint answers with JSON whose ``message_content`` (or ``i``) field holds
-    HTML containing ``<textarea id="file1">URL</textarea>`` and ``#delCode``.
+    HTML containing ``<textarea id="file1">URL</textarea>`` and a delete code.
+    Rejections (for example an unsupported file extension) carry ``index_err``.
     """
     snippet = _one_line(response_text[:300])
     try:
@@ -568,21 +589,41 @@ def parse_public_upload_response(response_text: str) -> dict[str, str]:
             if fragment:
                 break
     if not isinstance(fragment, str) or not fragment.strip():
-        # A rejection (size limit, banned extension, ...) has no link section.
         raise PermanentUploadError(
-            f"uploadkon.ir rejected the upload: {snippet}"
+            f"uploadkon.ir rejected the upload: {_public_rejection_message(payload)}"
         )
 
     values = extract_textarea_values(fragment)
     direct_url = values.get("file1", "").strip()
     if not direct_url.startswith(("http://", "https://")):
-        match = re.search(r"https?://[^\s<>\"']+", html.unescape(fragment))
+        match = re.search(r"https?://(?:www\.)?uploadkon\.ir/[^\s<>\"']+",
+                          html.unescape(fragment))
         direct_url = match.group(0) if match else ""
     if not direct_url:
-        raise RetryableUploadError(
-            f"uploadkon.ir response did not contain a file link: {snippet}"
+        raise PermanentUploadError(
+            f"uploadkon.ir rejected the upload: {_public_rejection_message(payload)}"
         )
-    return {"direct_url": direct_url, "delete_code": values.get("delCode", "").strip()}
+    delete_code = values.get("delCode", "").strip() or next(
+        (value for key, value in values.items() if "del" in key.lower()), ""
+    )
+    return {"direct_url": direct_url, "delete_code": delete_code}
+
+
+def build_archive(path: Path) -> tuple[bytes, str]:
+    """Return zip bytes containing ``path`` and the archive filename.
+
+    The anonymous uploadkon.ir endpoint rejects ``.txt``/``.csv``/``.log`` and other
+    text extensions ("پسوند ... پشتیبانی نمیشود"), but accepts archives.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.write(path, arcname=path.name)
+    return buffer.getvalue(), f"{path.name}.zip"
+
+
+def _public_archive_enabled() -> bool:
+    raw = os.getenv("UPLOADKON_PUBLIC_ARCHIVE", "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 def _public_upload_url() -> str:
@@ -599,6 +640,7 @@ def _public_upload_headers() -> dict[str, str]:
         "X-Requested-With": "XMLHttpRequest",
         "Origin": origin,
         "Referer": url,
+        "Connection": "close",
         "Pragma": "no-cache",
         "Cache-Control": "no-cache",
         "User-Agent": (
@@ -628,6 +670,7 @@ def _public_upload_headers() -> dict[str, str]:
         "X-Requested-With": "XMLHttpRequest",
         "Origin": origin,
         "Referer": url,
+        "Connection": "close",
         "Pragma": "no-cache",
         "Cache-Control": "no-cache",
         "User-Agent": (
@@ -675,15 +718,25 @@ def _public_upload_once(path: Path, timeout: float) -> dict[str, str]:
         _configure_session(session)
         _warm_up_public_session(session, timeout)
         headers = _public_upload_headers()
-        # Reopen the file for every attempt so a retry always sends the full body.
-        with path.open("rb") as handle:
-            response = session.post(
-                url,
-                headers=headers,
-                data={"submitr": "1", "ajax": "1"},
-                files={"file": (path.name, handle, "text/plain")},
-                timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), timeout),
-            )
+        if _public_archive_enabled():
+            payload, upload_name = build_archive(path)
+            mime = "application/zip"
+        else:
+            # Reopen the file for every attempt so a retry always sends the full body.
+            payload = path.read_bytes()
+            upload_name = path.name
+            mime = "text/plain"
+        print(
+            f"Uploading {upload_name} ({len(payload)} bytes) to the public "
+            "uploadkon.ir endpoint ..."
+        )
+        response = session.post(
+            url,
+            headers=headers,
+            data={"submitr": "1", "ajax": "1"},
+            files={"file": (upload_name, payload, mime)},
+            timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), timeout),
+        )
         status = response.status_code
         snippet = _one_line(response.text[:300])
         if status in RETRYABLE_HTTP_STATUS:
