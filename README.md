@@ -11,13 +11,16 @@ In **Settings → Secrets and variables → Actions**, add:
 ### Variables
 
 - `CHANNEL_IDS` — required; comma-separated Telegram channel usernames or numeric IDs, e.g. `@public_channel,@another_public_channel`. You do not need to own or administer public channels; use their `@username` (recommended) and the authenticated Telegram account can read their public posts. For private channels, the account must be a member. A bare numeric channel ID may not be resolvable unless that Telegram session already has the channel's entity/access hash cached, so public usernames are the most reliable format.
-- `UPLOADKON_URL` — optional; defaults to `https://my.uploadkon.ir/api/v1/file-entries`.
+- `UPLOADKON_MODE` — optional; `auto` (default) sends the file to the public `uploadkon.ir` uploader first and falls back to the `my.uploadkon.ir` drive API when a cookie is configured. Use `public` to only use the anonymous uploader (no secrets needed) or `drive` to only use the account drive API.
+- `UPLOADKON_PUBLIC_URL` — optional; public upload endpoint, defaults to `https://uploadkon.ir/`.
+- `UPLOADKON_URL` — optional; authenticated drive API used when the mode includes `drive`; defaults to `https://my.uploadkon.ir/api/v1/file-entries`.
 - `UPLOADKON_BACKEND_ID` — optional; defaults to `cdc_W8Ekm8` from the supplied upload form.
 - `UPLOADKON_PARENT_ID` — optional; defaults to the drive root (empty).
 - `UPLOADKON_WORKSPACE_ID` — optional; defaults to `0`.
 - `UPLOADKON_UPLOAD_TYPE` — optional; defaults to `bedrive`.
 - `UPLOADKON_MAX_ATTEMPTS` — optional; how many times a failed upload is retried (default `4`).
 - `UPLOADKON_TIMEOUT` — optional; read timeout in seconds per upload attempt (default `120`).
+- `UPLOADKON_TOTAL_TIMEOUT` — optional; total seconds allowed for all upload attempts and endpoints (default `600`).
 
 ### Secrets
 
@@ -33,7 +36,7 @@ In **Settings → Secrets and variables → Actions**, add:
   ```
 
   Replace `API_ID` and `API_HASH` with local values, complete Telegram's login/2FA prompts, then save the printed string as the GitHub secret. Treat it like a password; it grants access to the Telegram account.
-- `UPLOADKON_COOKIE` — the current full `Cookie` header value from an authenticated UploadKon session.
+- `UPLOADKON_COOKIE` — optional when `UPLOADKON_MODE=public`; the current full `Cookie` header value from an authenticated UploadKon session (required for `drive`).
 - `UPLOADKON_XSRF_TOKEN` — the XSRF token expected in the `X-XSRF-TOKEN` request header (URL-decode the `XSRF-TOKEN` cookie value if necessary).
 
 UploadKon's browser session credentials expire and may need to be refreshed. Rotate/revoke any session cookies or XSRF values that have been shared outside GitHub Secrets; do not paste credentials into source code, issues, or logs. The request example provided for this project contained session-cookie/XSRF credentials, so invalidate that session and create fresh values before running this workflow.
@@ -44,15 +47,21 @@ Files are named `mtproto-proxies-YYYY-MM-DD_HH-MM-SS.txt`, with the timestamp in
 
 ## Upload reliability
 
-The generated `.txt` file is sent straight to UploadKon as a multipart upload in the same job. Because UploadKon (`my.uploadkon.ir`) is often slow or intermittently unreachable from GitHub's runners, the uploader:
+The generated `.txt` is uploaded straight to UploadKon from the same job, with retries and two interchangeable endpoints:
 
-- refreshes the UploadKon session/`XSRF-TOKEN` from `UPLOADKON_COOKIE` before each attempt;
+- **`public`** (default first choice) — `POST https://uploadkon.ir/` with `submitr=1`, `ajax=1` and the `file` field, exactly like the site's browser AJAX flow. No login is needed; the response returns a direct file link and a delete code, both printed as notices. The free tier accepts up to 100 MB and removes files after 15 days.
+- **`drive`** — the authenticated `my.uploadkon.ir` drive API using `UPLOADKON_COOKIE`/`UPLOADKON_XSRF_TOKEN`, used as the fallback in `auto` mode (it has been observed to hang for minutes on GitHub runners).
+
+Per endpoint, the uploader:
+
+- refreshes the UploadKon session/`XSRF-TOKEN` before each drive attempt;
 - uses a separate connect timeout (30 s) and a configurable read timeout (`UPLOADKON_TIMEOUT`, default 120 s);
 - retries timeouts, connection resets, HTTP `408`/`425`/`429`/`5xx`, non-JSON replies, and expired session/CSRF responses (`401`/`403`/`419`) up to `UPLOADKON_MAX_ATTEMPTS` times (default 4) with exponential backoff (5 s, 10 s, 20 s, capped at 30 s);
-- fails fast for permanent errors such as `400` (bad request) or a missing `UPLOADKON_COOKIE` secret;
-- reopens the file for every attempt so a retry always sends the full body, and reports the uploaded file link as a workflow notice when the API returns one.
+- stays inside an overall `UPLOADKON_TOTAL_TIMEOUT` budget (default 600 s) so retries never outlast the job;
+- fails fast for permanent errors such as `400` (bad request) or a rejection with no file link, then moves on to the next endpoint;
+- reopens the file for every attempt so a retry always sends the full body.
 
-If every attempt fails, the job still fails with the last error in the summary, but the proxy list is always kept as the `mtproto-proxies` workflow artifact. Note that a retry after a read timeout can occasionally create a duplicate file on UploadKon, since the server may have received the first request.
+If every attempt at every endpoint fails, the job fails with the collected error details, but the proxy list is always kept as the `mtproto-proxies` workflow artifact. A retry after a read timeout can occasionally create a duplicate file on UploadKon, since the server may have received the first request.
 
 ## Local checks
 

@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -132,6 +133,7 @@ class UploadRetryTests(unittest.TestCase):
         env = {
             "UPLOADKON_COOKIE": "aplod_kn_session=abc; XSRF-TOKEN=def",
             "UPLOADKON_XSRF_TOKEN": "def",
+            "UPLOADKON_MODE": "drive",
         }
         env_patcher = mock.patch.dict(os.environ, env)
         env_patcher.start()
@@ -291,7 +293,11 @@ class SessionRefreshTests(unittest.TestCase):
 
             with mock.patch.dict(
                 os.environ,
-                {"UPLOADKON_COOKIE": "aplod_kn_session=abc", "UPLOADKON_XSRF_TOKEN": "def"},
+                {
+                    "UPLOADKON_COOKIE": "aplod_kn_session=abc",
+                    "UPLOADKON_XSRF_TOKEN": "def",
+                    "UPLOADKON_MODE": "drive",
+                },
             ), mock.patch("fetch_and_upload.requests.Session", return_value=session):
                 upload_file(path)
 
@@ -299,3 +305,153 @@ class SessionRefreshTests(unittest.TestCase):
             headers = session.post.call_args.kwargs["headers"]
             self.assertEqual(headers["Cookie"], "aplod_kn_session=abc")
             self.assertEqual(headers["X-XSRF-TOKEN"], "def")
+
+
+class PublicResponseParsingTests(unittest.TestCase):
+    def test_extracts_direct_and_delete_links(self):
+        from fetch_and_upload import parse_public_upload_response
+
+        fragment = (
+            "<div class='alert alert-success'>"
+            "<textarea id='file1' rows='3'>https://uploadkon.ir/uploads/abc.txt</textarea>"
+            "<textarea id='delCode'>del123</textarea></div>"
+        )
+        result = parse_public_upload_response(json.dumps([{"message_content": fragment}]))
+        self.assertEqual(result["direct_url"], "https://uploadkon.ir/uploads/abc.txt")
+        self.assertEqual(result["delete_code"], "del123")
+
+    def test_accepts_i_field_and_html_entities(self):
+        from fetch_and_upload import parse_public_upload_response
+
+        result = parse_public_upload_response(
+            '{"i": "<textarea id=\\"file1\\">https://uploadkon.ir/uploads/x.txt?a=1&amp;b=2</textarea>"}'
+        )
+        self.assertEqual(result["direct_url"], "https://uploadkon.ir/uploads/x.txt?a=1&b=2")
+
+    def test_rejection_without_link_is_permanent(self):
+        from fetch_and_upload import PermanentUploadError, parse_public_upload_response
+
+        with self.assertRaises(PermanentUploadError):
+            parse_public_upload_response('[{"status": false, "message": "file too large"}]')
+
+    def test_non_json_reply_is_retryable(self):
+        from fetch_and_upload import RetryableUploadError, parse_public_upload_response
+
+        with self.assertRaises(RetryableUploadError):
+            parse_public_upload_response("<html>502 Bad Gateway</html>")
+
+
+@unittest.skipUnless(HAS_REQUESTS, "requests is not installed")
+class UploadModeTests(unittest.TestCase):
+    def test_auto_prefers_public_then_drive(self):
+        from fetch_and_upload import _upload_targets
+
+        self.assertEqual(_upload_targets("auto", True), ["public", "drive"])
+        self.assertEqual(_upload_targets("auto", False), ["public"])
+        self.assertEqual(_upload_targets("public", True), ["public"])
+        self.assertEqual(_upload_targets("drive", True), ["drive"])
+
+    def test_unknown_mode_is_rejected(self):
+        from fetch_and_upload import PermanentUploadError, _upload_targets
+
+        with self.assertRaises(PermanentUploadError):
+            _upload_targets("ftp", True)
+
+    def test_public_success_reports_direct_link(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from fetch_and_upload import upload_file
+
+        body = '[{"message_content": "<textarea id=\\"file1\\">https://uploadkon.ir/uploads/p.txt</textarea><textarea id=\\"delCode\\">del789</textarea>"}]'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mtproto-proxies-test.txt"
+            path.write_text("tg://proxy?server=a&port=443&secret=b\n", encoding="utf-8")
+
+            session = mock.MagicMock()
+            session.post.return_value = _FakeResponse(200, text=body)
+            with mock.patch.dict(os.environ, {"UPLOADKON_MODE": "public"}), \
+                    mock.patch("fetch_and_upload.requests.Session", return_value=session), \
+                    mock.patch("builtins.print") as printed:
+                upload_file(path)
+
+            self.assertEqual(session.post.call_count, 1)
+            output = " ".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+            self.assertIn("https://uploadkon.ir/uploads/p.txt", output)
+            self.assertIn("del789", output)
+
+    def test_falls_back_to_drive_when_public_fails(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from fetch_and_upload import upload_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mtproto-proxies-test.txt"
+            path.write_text("tg://proxy?server=a&port=443&secret=b\n", encoding="utf-8")
+
+            session = mock.MagicMock()
+
+            def post(url, **kwargs):
+                if url == "https://uploadkon.ir/":
+                    return _FakeResponse(503, text="service unavailable")
+                return _FakeResponse(200, {"data": {"url": "https://my.uploadkon.ir/d/ok"}})
+
+            session.post.side_effect = post
+            session.get.return_value = _FakeResponse(200, {"data": []})
+            env = {
+                "UPLOADKON_MODE": "auto",
+                "UPLOADKON_COOKIE": "aplod_kn_session=abc",
+                "UPLOADKON_XSRF_TOKEN": "def",
+                "UPLOADKON_MAX_ATTEMPTS": "1",
+            }
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch("fetch_and_upload.requests.Session", return_value=session), \
+                    mock.patch("builtins.print"):
+                upload_file(path)
+
+            urls = [c.args[0] if c.args else c.kwargs.get("url") for c in session.post.call_args_list]
+            self.assertTrue(any(u == "https://uploadkon.ir/" for u in urls), urls)
+            self.assertTrue(any(u.startswith("https://my.uploadkon.ir") for u in urls), urls)
+
+
+@unittest.skipUnless(HAS_REQUESTS, "requests is not installed")
+class UploadBudgetTests(unittest.TestCase):
+    def test_stops_retrying_when_budget_is_exhausted(self):
+        import os
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest import mock
+
+        import requests as requests_module
+
+        from fetch_and_upload import upload_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mtproto-proxies-test.txt"
+            path.write_text("tg://proxy?server=a&port=443&secret=b\n", encoding="utf-8")
+
+            session = mock.MagicMock()
+            session.post.side_effect = requests_module.exceptions.ReadTimeout("slow")
+            env = {
+                "UPLOADKON_MODE": "public",
+                "UPLOADKON_MAX_ATTEMPTS": "50",
+                "UPLOADKON_TIMEOUT": "1",
+                "UPLOADKON_TOTAL_TIMEOUT": "15",
+            }
+            started = time.monotonic()
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch("fetch_and_upload.requests.Session", return_value=session), \
+                    mock.patch("builtins.print"):
+                with self.assertRaises(RuntimeError):
+                    upload_file(path)
+            elapsed = time.monotonic() - started
+
+            # The 15s budget must end the loop long before 50 attempts.
+            self.assertLess(elapsed, 15)
+            self.assertLess(session.post.call_count, 50)

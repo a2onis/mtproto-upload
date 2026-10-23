@@ -27,6 +27,10 @@ jobs:
       TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
       TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
       TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+      # public = anonymous uploadkon.ir endpoint (default), drive = my.uploadkon.ir
+      # account API, auto = try public first and fall back to drive when a cookie exists.
+      UPLOADKON_MODE: ${{ vars.UPLOADKON_MODE || 'auto' }}
+      UPLOADKON_PUBLIC_URL: ${{ vars.UPLOADKON_PUBLIC_URL }}
       UPLOADKON_COOKIE: ${{ secrets.UPLOADKON_COOKIE }}
       UPLOADKON_XSRF_TOKEN: ${{ secrets.UPLOADKON_XSRF_TOKEN }}
       UPLOADKON_URL: ${{ vars.UPLOADKON_URL }}
@@ -38,6 +42,7 @@ jobs:
       # Retry transient UploadKon failures (timeouts, 5xx, expired session) before failing.
       UPLOADKON_MAX_ATTEMPTS: ${{ vars.UPLOADKON_MAX_ATTEMPTS || '4' }}
       UPLOADKON_TIMEOUT: ${{ vars.UPLOADKON_TIMEOUT || '120' }}
+      UPLOADKON_TOTAL_TIMEOUT: ${{ vars.UPLOADKON_TOTAL_TIMEOUT || '600' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -51,8 +56,10 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Validate required secrets
         run: |
-          test -n "$UPLOADKON_COOKIE" || { echo 'Missing UPLOADKON_COOKIE secret'; exit 1; }
           test -n "$CHANNEL_IDS" || { echo 'Missing CHANNEL_IDS repository variable or secret'; exit 1; }
+          if [ "$UPLOADKON_MODE" = "drive" ]; then
+            test -n "$UPLOADKON_COOKIE" || { echo 'UPLOADKON_MODE=drive requires the UPLOADKON_COOKIE secret'; exit 1; }
+          fi
       - name: Collect and upload
         run: python fetch_and_upload.py
       - name: Upload proxy list artifact

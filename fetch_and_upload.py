@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
@@ -30,6 +32,8 @@ if TYPE_CHECKING:
 
 TEHRAN = ZoneInfo("Asia/Tehran")
 DEFAULT_UPLOAD_URL = "https://my.uploadkon.ir/api/v1/file-entries"
+# Public anonymous uploader (no login); returns a direct file link.
+DEFAULT_PUBLIC_UPLOAD_URL = "https://uploadkon.ir/"
 DEFAULT_LOOKBACK_HOURS = 12
 # Uploading to UploadKon can be slow: retry several times before giving up.
 DEFAULT_UPLOAD_ATTEMPTS = 4
@@ -37,6 +41,9 @@ DEFAULT_UPLOAD_TIMEOUT = 120.0
 UPLOAD_CONNECT_TIMEOUT = 30.0
 UPLOAD_BACKOFF_SECONDS = 5.0
 UPLOAD_BACKOFF_MAX_SECONDS = 30.0
+# Overall budget for all endpoints/attempts so retries cannot outlast the CI job.
+DEFAULT_TOTAL_UPLOAD_TIMEOUT = 600.0
+MIN_ATTEMPT_SECONDS = 10.0
 RETRYABLE_HTTP_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 AUTH_HTTP_STATUS = frozenset({401, 403, 419})
 MAX_WEB_PAGES_PER_CHANNEL = 25
@@ -409,7 +416,7 @@ def _refresh_upload_session(session: requests.Session, cookie: str, raw_xsrf: st
             f"{_upload_origin()}/api/v1/drive/file-entries",
             params={"perPage": 1},
             headers={**base_headers, "Cookie": cookie, "Connection": "close"},
-            timeout=(UPLOAD_CONNECT_TIMEOUT, min(timeout, 60.0)),
+            timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), min(timeout, 60.0)),
         )
     except requests.exceptions.RequestException as exc:
         # A slow session endpoint must not block the upload itself: fall back to
@@ -502,8 +509,136 @@ def _find_upload_link(payload: object, depth: int = 0) -> str | None:
     return None
 
 
+class _TextareaParser(HTMLParser):
+    """Collect ``<textarea id=...>value</textarea>`` pairs from UploadKon HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._current_id: str | None = None
+        self._buffer: list[str] = []
+        self.values: dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "textarea":
+            return
+        attr_map = {name.lower(): value for name, value in attrs}
+        textarea_id = attr_map.get("id")
+        if textarea_id:
+            self._current_id = textarea_id
+            self._buffer = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current_id is not None:
+            self._buffer.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "textarea" and self._current_id is not None:
+            self.values[self._current_id] = "".join(self._buffer).strip()
+            self._current_id = None
+            self._buffer = []
+
+
+def extract_textarea_values(html_fragment: str) -> dict[str, str]:
+    """Return ``{textarea id: value}`` from a fragment of UploadKon HTML."""
+    parser = _TextareaParser()
+    parser.feed(html_fragment or "")
+    parser.close()
+    return {key: html.unescape(value) for key, value in parser.values.items()}
+
+
+def parse_public_upload_response(response_text: str) -> dict[str, str]:
+    """Parse the anonymous uploadkon.ir AJAX reply into direct/delete links.
+
+    The endpoint answers with JSON whose ``message_content`` (or ``i``) field holds
+    HTML containing ``<textarea id="file1">URL</textarea>`` and ``#delCode``.
+    """
+    snippet = _one_line(response_text[:300])
+    try:
+        payload = json.loads(response_text)
+    except (TypeError, ValueError) as exc:
+        raise RetryableUploadError(
+            f"uploadkon.ir did not return JSON: {snippet}"
+        ) from exc
+
+    items = payload if isinstance(payload, list) else [payload]
+    fragment = ""
+    for item in items:
+        if isinstance(item, dict):
+            fragment = item.get("message_content") or item.get("i") or ""
+            if fragment:
+                break
+    if not isinstance(fragment, str) or not fragment.strip():
+        # A rejection (size limit, banned extension, ...) has no link section.
+        raise PermanentUploadError(
+            f"uploadkon.ir rejected the upload: {snippet}"
+        )
+
+    values = extract_textarea_values(fragment)
+    direct_url = values.get("file1", "").strip()
+    if not direct_url.startswith(("http://", "https://")):
+        match = re.search(r"https?://[^\s<>\"']+", html.unescape(fragment))
+        direct_url = match.group(0) if match else ""
+    if not direct_url:
+        raise RetryableUploadError(
+            f"uploadkon.ir response did not contain a file link: {snippet}"
+        )
+    return {"direct_url": direct_url, "delete_code": values.get("delCode", "").strip()}
+
+
+def _public_upload_url() -> str:
+    return os.getenv("UPLOADKON_PUBLIC_URL") or DEFAULT_PUBLIC_UPLOAD_URL
+
+
+def _public_upload_headers() -> dict[str, str]:
+    url = _public_upload_url()
+    parts = urlsplit(url)
+    origin = f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else url
+    return {
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": origin,
+        "Referer": url,
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+    }
+
+
+def _public_upload_once(path: Path, timeout: float) -> dict[str, str]:
+    """Upload ``path`` to the public uploadkon.ir endpoint (no login required)."""
+    url = _public_upload_url()
+    session = requests.Session()
+    try:
+        # Reopen the file for every attempt so a retry always sends the full body.
+        with path.open("rb") as handle:
+            response = session.post(
+                url,
+                headers=_public_upload_headers(),
+                data={"submitr": "1", "ajax": "1"},
+                files={"file": (path.name, handle, "text/plain")},
+                timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), timeout),
+            )
+        status = response.status_code
+        snippet = _one_line(response.text[:300])
+        if status in RETRYABLE_HTTP_STATUS:
+            raise RetryableUploadError(f"uploadkon.ir HTTP {status}: {snippet}")
+        if status in AUTH_HTTP_STATUS:
+            raise RetryableUploadError(
+                f"uploadkon.ir HTTP {status} (blocked or requires a cookie): {snippet}"
+            )
+        if not response.ok:
+            raise PermanentUploadError(f"uploadkon.ir HTTP {status}: {snippet}")
+        return parse_public_upload_response(response.text)
+    finally:
+        session.close()
+
+
 def _upload_once(path: Path, timeout: float) -> dict | list:
-    """Perform one complete upload attempt (session refresh + multipart POST)."""
+    """One authenticated UploadKon drive upload attempt (session + POST)."""
     cookie, raw_xsrf = _load_upload_credentials()
     base_headers = _upload_base_headers()
     url = _upload_url()
@@ -526,35 +661,91 @@ def _upload_once(path: Path, timeout: float) -> dict | list:
                 headers=headers,
                 data=_upload_form_fields(),
                 files={"file": (path.name, handle, "text/plain")},
-                timeout=(UPLOAD_CONNECT_TIMEOUT, timeout),
+                timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), timeout),
             )
         return _check_upload_response(response)
     finally:
         session.close()
 
 
-def upload_file(path: Path) -> None:
-    """Upload ``path`` to UploadKon, retrying transient failures several times."""
-    attempts = _positive_int_env("UPLOADKON_MAX_ATTEMPTS", DEFAULT_UPLOAD_ATTEMPTS)
-    timeout = _positive_float_env("UPLOADKON_TIMEOUT", DEFAULT_UPLOAD_TIMEOUT)
-    _configure_tcp_mss()
+UPLOAD_TARGETS = ("public", "drive")
+DEFAULT_UPLOAD_MODE = "auto"
 
-    print(
-        f"Uploading {path.name} to UploadKon "
-        f"(up to {attempts} attempt(s), {timeout:.0f}s read timeout each)."
+
+def _upload_targets(mode: str, cookie_available: bool) -> list[str]:
+    """Return the ordered list of upload targets to try for ``mode``.
+
+    ``auto`` sends the file to the public uploadkon.ir endpoint first (fast, no
+    login) and falls back to the authenticated drive API when configured.
+    """
+    mode = (mode or DEFAULT_UPLOAD_MODE).strip().lower()
+    if mode in ("public", "direct"):
+        return ["public"]
+    if mode in ("drive", "account", "my"):
+        return ["drive"]
+    if mode == DEFAULT_UPLOAD_MODE:
+        targets = ["public"]
+        if cookie_available:
+            targets.append("drive")
+        return targets
+    raise PermanentUploadError(
+        f"UPLOADKON_MODE must be one of {', '.join((*UPLOAD_TARGETS, DEFAULT_UPLOAD_MODE))}, "
+        f"got {mode!r}"
     )
 
+
+def _upload_target_once(target: str, path: Path, timeout: float) -> object:
+    return _public_upload_once(path, timeout) if target == "public" else _upload_once(path, timeout)
+
+
+def _report_upload_success(target: str, result: object) -> None:
+    print(f"Upload to UploadKon ({target}) completed successfully.")
+    if target == "public" and isinstance(result, dict):
+        link = result.get("direct_url", "")
+        delete_code = result.get("delete_code", "")
+        if link:
+            print(f"::notice::Uploaded file: {link}")
+            print(f"Direct link: {link}")
+        if delete_code:
+            print(f"Delete code: {delete_code}")
+        print("::notice::Upload to UploadKon completed successfully.")
+        return
+
+    print("::notice::Upload to UploadKon completed successfully.")
+    link = _find_upload_link(result)
+    if link:
+        print(f"::notice::Uploaded file: {link}")
+
+
+def _try_upload_target(target: str, path: Path, attempts: int, timeout: float,
+                       deadline: float) -> None:
+    """Upload via one target with retries; raises when every attempt fails."""
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
+        remaining = deadline - time.monotonic()
+        if remaining < MIN_ATTEMPT_SECONDS:
+            last_error = last_error or RuntimeError("upload time budget exhausted")
+            print(
+                f"Stopping {target} upload attempts: only {remaining:.0f}s of the "
+                "configured upload budget remain.",
+                file=sys.stderr,
+            )
+            break
         try:
-            result = _upload_once(path, timeout)
-        except PermanentUploadError:
+            result = _upload_target_once(target, path, min(timeout, remaining))
+        except PermanentUploadError as exc:
+            message = (
+                f"Upload via {target} failed permanently: "
+                f"{type(exc).__name__}: {_one_line(exc)}"
+            )
+            print(message, file=sys.stderr)
+            print(f"::warning::{message}", file=sys.stderr)
             raise
         except (RetryableUploadError, OSError) as exc:
             # Timeouts/resets (requests raises IOError subclasses), 5xx, expired CSRF.
             last_error = exc
             message = (
-                f"Upload attempt {attempt}/{attempts} failed: "
+                f"Upload attempt {attempt}/{attempts} via {target} failed: "
                 f"{type(exc).__name__}: {_one_line(exc)}"
             )
             print(message, file=sys.stderr)
@@ -564,21 +755,69 @@ def upload_file(path: Path) -> None:
                     UPLOAD_BACKOFF_SECONDS * (2 ** (attempt - 1)),
                     UPLOAD_BACKOFF_MAX_SECONDS,
                 )
+                if deadline - time.monotonic() <= delay + MIN_ATTEMPT_SECONDS:
+                    break
                 print(f"Retrying the UploadKon upload in {delay:.0f}s ...")
                 time.sleep(delay)
             continue
 
-        print("Upload completed successfully.")
-        print("::notice::Upload to UploadKon completed successfully.")
-        link = _find_upload_link(result)
-        if link:
-            print(f"::notice::Uploaded file: {link}")
+        _report_upload_success(target, result)
         return
 
     raise RuntimeError(
-        f"UploadKon upload failed after {attempts} attempt(s): "
+        f"{target} upload failed after {attempts} attempt(s): "
         f"{type(last_error).__name__}: {_one_line(last_error)}"
     )
+
+
+def upload_file(path: Path) -> None:
+    """Send ``path`` to UploadKon, retrying and falling back between endpoints."""
+    attempts = _positive_int_env("UPLOADKON_MAX_ATTEMPTS", DEFAULT_UPLOAD_ATTEMPTS)
+    timeout = _positive_float_env("UPLOADKON_TIMEOUT", DEFAULT_UPLOAD_TIMEOUT)
+    mode = os.getenv("UPLOADKON_MODE", DEFAULT_UPLOAD_MODE)
+    cookie_available = bool(_strip_header_prefix(os.getenv("UPLOADKON_COOKIE", ""), "cookie:"))
+    targets = _upload_targets(mode, cookie_available)
+    total_budget = _positive_float_env("UPLOADKON_TOTAL_TIMEOUT", DEFAULT_TOTAL_UPLOAD_TIMEOUT)
+    deadline = time.monotonic() + total_budget
+    _configure_tcp_mss()
+
+    print(
+        f"Uploading {path.name} to UploadKon via {' -> '.join(targets)} "
+        f"(up to {attempts} attempt(s) per endpoint, {timeout:.0f}s read timeout each, "
+        f"{total_budget:.0f}s total budget)."
+    )
+
+    failures: list[str] = []
+    permanent_only = True
+    for index, target in enumerate(targets):
+        try:
+            _try_upload_target(target, path, attempts, timeout, deadline)
+        except UploadError as exc:
+            permanent_only = permanent_only and isinstance(exc, PermanentUploadError)
+            failures.append(f"{target}: {type(exc).__name__}: {_one_line(exc)}")
+            if target == "public" and not os.getenv("UPLOADKON_PUBLIC_URL"):
+                # The public endpoint is anonymous; a hard rejection here usually
+                # means the host is blocking GitHub's runners.
+                print(
+                    "Public uploadkon.ir endpoint rejected the upload; "
+                    "trying the next target if one is configured.",
+                    file=sys.stderr,
+                )
+        except RuntimeError as exc:
+            permanent_only = False
+            failures.append(f"{target}: {_one_line(exc)}")
+        else:
+            return
+        if index + 1 < len(targets):
+            print(
+                f"Falling back to the {targets[index + 1]} UploadKon endpoint ...",
+                file=sys.stderr,
+            )
+
+    summary = "UploadKon upload failed for every endpoint: " + " | ".join(failures)
+    if permanent_only:
+        raise PermanentUploadError(summary)
+    raise RuntimeError(summary)
 
 
 def main() -> int:
