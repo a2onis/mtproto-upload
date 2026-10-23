@@ -16,6 +16,8 @@ In **Settings → Secrets and variables → Actions**, add:
 - `UPLOADKON_PARENT_ID` — optional; defaults to the drive root (empty).
 - `UPLOADKON_WORKSPACE_ID` — optional; defaults to `0`.
 - `UPLOADKON_UPLOAD_TYPE` — optional; defaults to `bedrive`.
+- `UPLOADKON_MAX_ATTEMPTS` — optional; how many times a failed upload is retried (default `4`).
+- `UPLOADKON_TIMEOUT` — optional; read timeout in seconds per upload attempt (default `120`).
 
 ### Secrets
 
@@ -39,6 +41,18 @@ UploadKon's browser session credentials expire and may need to be refreshed. Rot
 ## Output behavior
 
 Files are named `mtproto-proxies-YYYY-MM-DD_HH-MM-SS.txt`, with the timestamp in `Asia/Tehran`. For each channel, the job reads newest-first and processes messages from the previous 12 hours, stopping at the cutoff; it does not cap the number of messages within that window. It deduplicates links within each output file. GitHub Actions scheduled runs can be delayed, so a delay longer than the 12-hour lookback may leave a gap. It recognizes `tg://proxy?...` and `t.me/proxy?...` / `telegram.me/proxy?...` links containing `server`, `port`, and `secret`. If no valid configs are found, an empty local file is created and upload is skipped. Files are created on the ephemeral Actions runner and are not committed to the repository.
+
+## Upload reliability
+
+The generated `.txt` file is sent straight to UploadKon as a multipart upload in the same job. Because UploadKon (`my.uploadkon.ir`) is often slow or intermittently unreachable from GitHub's runners, the uploader:
+
+- refreshes the UploadKon session/`XSRF-TOKEN` from `UPLOADKON_COOKIE` before each attempt;
+- uses a separate connect timeout (30 s) and a configurable read timeout (`UPLOADKON_TIMEOUT`, default 120 s);
+- retries timeouts, connection resets, HTTP `408`/`425`/`429`/`5xx`, non-JSON replies, and expired session/CSRF responses (`401`/`403`/`419`) up to `UPLOADKON_MAX_ATTEMPTS` times (default 4) with exponential backoff (5 s, 10 s, 20 s, capped at 30 s);
+- fails fast for permanent errors such as `400` (bad request) or a missing `UPLOADKON_COOKIE` secret;
+- reopens the file for every attempt so a retry always sends the full body, and reports the uploaded file link as a workflow notice when the API returns one.
+
+If every attempt fails, the job still fails with the last error in the summary, but the proxy list is always kept as the `mtproto-proxies` workflow artifact. Note that a retry after a read timeout can occasionally create a duplicate file on UploadKon, since the server may have received the first request.
 
 ## Local checks
 

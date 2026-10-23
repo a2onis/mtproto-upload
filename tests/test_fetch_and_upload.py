@@ -10,6 +10,13 @@ from fetch_and_upload import (
     parse_web_preview_page,
 )
 
+try:  # Upload tests need requests; skip them instead of failing on a bare interpreter.
+    import requests as _requests  # noqa: F401
+
+    HAS_REQUESTS = True
+except ImportError:  # pragma: no cover
+    HAS_REQUESTS = False
+
 
 class ProxyExtractionTests(unittest.TestCase):
     def test_extracts_and_normalizes_mtproto_links(self):
@@ -89,3 +96,206 @@ class FilenameTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeResponse:
+    """Minimal requests.Response stand-in for upload tests."""
+
+    def __init__(self, status_code: int = 200, payload=None, text: str = ""):
+        import requests
+
+        self.status_code = status_code
+        self.ok = 200 <= status_code < 400
+        self._payload = payload
+        self.text = text or ("{}" if payload is not None else "")
+        self.cookies = requests.cookies.RequestsCookieJar()
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json in response")
+        return self._payload
+
+
+@unittest.skipUnless(HAS_REQUESTS, "requests is not installed")
+class UploadRetryTests(unittest.TestCase):
+    def setUp(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "mtproto-proxies-test.txt"
+        self.path.write_text("tg://proxy?server=a&port=443&secret=b\n", encoding="utf-8")
+
+        env = {
+            "UPLOADKON_COOKIE": "aplod_kn_session=abc; XSRF-TOKEN=def",
+            "UPLOADKON_XSRF_TOKEN": "def",
+        }
+        env_patcher = mock.patch.dict(os.environ, env)
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+
+    def _install_session(self, get_response, post_side_effect):
+        from unittest import mock
+
+        session = mock.MagicMock()
+        session.get.return_value = get_response
+        session.post.side_effect = post_side_effect
+        patcher = mock.patch("fetch_and_upload.requests.Session", return_value=session)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return session
+
+    def _patch_sleep(self):
+        from unittest import mock
+
+        patcher = mock.patch("fetch_and_upload.time.sleep")
+        sleep = patcher.start()
+        self.addCleanup(patcher.stop)
+        return sleep
+
+    def test_retries_after_read_timeout_then_succeeds(self):
+        import requests
+        from fetch_and_upload import upload_file
+
+        session = self._install_session(
+            _FakeResponse(200, {"ok": True}),
+            [
+                requests.exceptions.ReadTimeout("read timed out"),
+                _FakeResponse(200, {"data": {"url": "https://my.uploadkon.ir/d/abc"}}),
+            ],
+        )
+        sleep = self._patch_sleep()
+
+        upload_file(self.path)
+
+        self.assertEqual(session.post.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_gives_up_after_configured_attempts(self):
+        import os
+        import requests
+        from fetch_and_upload import upload_file
+
+        os.environ["UPLOADKON_MAX_ATTEMPTS"] = "3"
+        session = self._install_session(
+            _FakeResponse(200, {"ok": True}),
+            requests.exceptions.ReadTimeout("read timed out"),
+        )
+        sleep = self._patch_sleep()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            upload_file(self.path)
+
+        self.assertIn("after 3 attempt(s)", str(ctx.exception))
+        self.assertEqual(session.post.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_retries_server_errors(self):
+        import requests
+        from fetch_and_upload import upload_file
+
+        session = self._install_session(
+            _FakeResponse(200, {"ok": True}),
+            [
+                _FakeResponse(502, text="bad gateway"),
+                _FakeResponse(200, {"ok": True}),
+            ],
+        )
+        sleep = self._patch_sleep()
+
+        upload_file(self.path)
+
+        self.assertEqual(session.post.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_does_not_retry_permanent_client_errors(self):
+        from fetch_and_upload import PermanentUploadError, upload_file
+
+        session = self._install_session(
+            _FakeResponse(200, {"ok": True}),
+            [_FakeResponse(400, text="invalid upload request")],
+        )
+        sleep = self._patch_sleep()
+
+        with self.assertRaises(PermanentUploadError):
+            upload_file(self.path)
+
+        self.assertEqual(session.post.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_retries_when_session_cookie_is_rejected(self):
+        import os
+        import requests
+        from fetch_and_upload import upload_file
+
+        os.environ["UPLOADKON_MAX_ATTEMPTS"] = "2"
+        session = self._install_session(
+            _FakeResponse(419, text="page expired"),
+            _FakeResponse(200, {"ok": True}),
+        )
+        sleep = self._patch_sleep()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            upload_file(self.path)
+
+        self.assertIn("after 2 attempt(s)", str(ctx.exception))
+        self.assertEqual(session.get.call_count, 2)
+        session.post.assert_not_called()
+        sleep.assert_called_once()
+
+
+@unittest.skipUnless(HAS_REQUESTS, "requests is not installed")
+class UploadLinkTests(unittest.TestCase):
+    def test_finds_nested_download_link(self):
+        from fetch_and_upload import _find_upload_link
+
+        payload = {
+            "data": {
+                "file": {"name": "mtproto.txt", "downloadUrl": "https://my.uploadkon.ir/d/xyz"}
+            }
+        }
+        self.assertEqual(
+            _find_upload_link(payload), "https://my.uploadkon.ir/d/xyz"
+        )
+
+    def test_returns_none_without_link(self):
+        from fetch_and_upload import _find_upload_link
+
+        self.assertIsNone(_find_upload_link({"ok": True, "data": {"id": 5}}))
+
+
+@unittest.skipUnless(HAS_REQUESTS, "requests is not installed")
+class SessionRefreshTests(unittest.TestCase):
+    """A slow session endpoint must not block the upload POST."""
+
+    def test_network_error_during_refresh_still_uploads(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        import requests as requests_module
+
+        from fetch_and_upload import upload_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mtproto-proxies-test.txt"
+            path.write_text("tg://proxy?server=a&port=443&secret=b\n", encoding="utf-8")
+
+            session = mock.MagicMock()
+            session.get.side_effect = requests_module.exceptions.ReadTimeout("slow")
+            session.post.return_value = _FakeResponse(200, {"ok": True})
+
+            with mock.patch.dict(
+                os.environ,
+                {"UPLOADKON_COOKIE": "aplod_kn_session=abc", "UPLOADKON_XSRF_TOKEN": "def"},
+            ), mock.patch("fetch_and_upload.requests.Session", return_value=session):
+                upload_file(path)
+
+            session.post.assert_called_once()
+            headers = session.post.call_args.kwargs["headers"]
+            self.assertEqual(headers["Cookie"], "aplod_kn_session=abc")
+            self.assertEqual(headers["X-XSRF-TOKEN"], "def")

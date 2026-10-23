@@ -21,7 +21,7 @@ permissions:
 jobs:
   collect-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       CHANNEL_IDS: ${{ vars.CHANNEL_IDS || secrets.CHANNEL_IDS }}
       TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -35,11 +35,14 @@ jobs:
       UPLOADKON_WORKSPACE_ID: ${{ vars.UPLOADKON_WORKSPACE_ID }}
       UPLOADKON_UPLOAD_TYPE: ${{ vars.UPLOADKON_UPLOAD_TYPE }}
       LOOKBACK_HOURS: "12"
+      # Retry transient UploadKon failures (timeouts, 5xx, expired session) before failing.
+      UPLOADKON_MAX_ATTEMPTS: ${{ vars.UPLOADKON_MAX_ATTEMPTS || '4' }}
+      UPLOADKON_TIMEOUT: ${{ vars.UPLOADKON_TIMEOUT || '120' }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install dependencies
@@ -54,7 +57,7 @@ jobs:
         run: python fetch_and_upload.py
       - name: Upload proxy list artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: mtproto-proxies
           path: mtproto-proxies-*.txt

@@ -6,6 +6,7 @@ import html
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -30,6 +31,14 @@ if TYPE_CHECKING:
 TEHRAN = ZoneInfo("Asia/Tehran")
 DEFAULT_UPLOAD_URL = "https://my.uploadkon.ir/api/v1/file-entries"
 DEFAULT_LOOKBACK_HOURS = 12
+# Uploading to UploadKon can be slow: retry several times before giving up.
+DEFAULT_UPLOAD_ATTEMPTS = 4
+DEFAULT_UPLOAD_TIMEOUT = 120.0
+UPLOAD_CONNECT_TIMEOUT = 30.0
+UPLOAD_BACKOFF_SECONDS = 5.0
+UPLOAD_BACKOFF_MAX_SECONDS = 30.0
+RETRYABLE_HTTP_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+AUTH_HTTP_STATUS = frozenset({401, 403, 419})
 MAX_WEB_PAGES_PER_CHANNEL = 25
 # Telegram proxy links are commonly shared as tg://proxy or t.me/proxy URLs.
 LINK_RE = re.compile(
@@ -281,18 +290,96 @@ def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
     return jar
 
 
-def upload_file(path: Path) -> None:
-    cookie = os.environ["UPLOADKON_COOKIE"].strip()
-    if cookie.lower().startswith("cookie:"):
-        cookie = cookie.split(":", 1)[1].strip()
-    raw_xsrf = os.getenv("UPLOADKON_XSRF_TOKEN", "").strip()
-    if raw_xsrf.lower().startswith("x-xsrf-token:"):
-        raw_xsrf = raw_xsrf.split(":", 1)[1].strip()
+def _strip_header_prefix(value: str, prefix: str) -> str:
+    """Accept values pasted as a full header line, e.g. ``Cookie: a=b``."""
+    value = (value or "").strip()
+    if value.lower().startswith(prefix.lower()):
+        value = value.split(":", 1)[1].strip()
+    return value
 
-    cookie_dict = _parse_cookie_header(cookie)
-    unquoted_raw_xsrf = unquote(raw_xsrf)
-    url = os.getenv("UPLOADKON_URL") or DEFAULT_UPLOAD_URL
-    fields = {
+
+def _one_line(value: object, limit: int = 300) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1.0, float(raw))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+
+
+class UploadError(RuntimeError):
+    """Base class for UploadKon upload failures."""
+
+
+class PermanentUploadError(UploadError):
+    """Failure that retrying cannot fix (bad configuration or request)."""
+
+
+class RetryableUploadError(UploadError):
+    """Failure that may succeed on a later attempt."""
+
+
+def _configure_tcp_mss() -> None:
+    """Clamp TCP MSS to 1000 bytes to avoid PMTU blackholes on routes to .ir hosts."""
+    import socket
+
+    from urllib3.connection import HTTPConnection
+
+    if not hasattr(socket, "TCP_MAXSEG"):
+        return
+    mss_opt = (socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1000)
+    if mss_opt not in HTTPConnection.default_socket_options:
+        HTTPConnection.default_socket_options = [
+            *HTTPConnection.default_socket_options,
+            mss_opt,
+        ]
+
+
+def _upload_url() -> str:
+    return os.getenv("UPLOADKON_URL") or DEFAULT_UPLOAD_URL
+
+
+def _upload_origin() -> str:
+    """Origin of the configured upload endpoint (defaults to my.uploadkon.ir)."""
+    parts = urlsplit(_upload_url())
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return "https://my.uploadkon.ir"
+
+
+def _upload_base_headers() -> dict[str, str]:
+    origin = _upload_origin()
+    return {
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": origin,
+        "Referer": f"{origin}/drive",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+    }
+
+
+def _upload_form_fields() -> dict[str, str]:
+    return {
         "clientMime": "text/plain",
         "clientExtension": "txt",
         "uploadType": os.getenv("UPLOADKON_UPLOAD_TYPE") or "bedrive",
@@ -301,75 +388,197 @@ def upload_file(path: Path) -> None:
         "workspaceId": os.getenv("UPLOADKON_WORKSPACE_ID") or "0",
         "relativePath": "",
     }
-    base_headers = {
-        "Accept": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": "https://my.uploadkon.ir",
-        "Referer": "https://my.uploadkon.ir/drive",
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        ),
-    }
 
-    # Clamp TCP MSS to 1000 bytes to avoid PMTU blackholes on routes to .ir hosts.
-    import socket
-    from urllib3.connection import HTTPConnection
-    if hasattr(socket, "TCP_MAXSEG"):
-        mss_opt = (socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1000)
-        if mss_opt not in HTTPConnection.default_socket_options:
-            HTTPConnection.default_socket_options = [
-                *HTTPConnection.default_socket_options,
-                mss_opt,
-            ]
 
-    # Bootstrap/refresh active session and XSRF-TOKEN when UPLOADKON_COOKIE only
-    # contains a long-lived remember_web_* cookie or when the 2h session rotated.
-    ent_resp = requests.get(
-        "https://my.uploadkon.ir/api/v1/drive/file-entries?perPage=1",
-        headers={
-            **base_headers,
-            "Cookie": cookie,
-            "Connection": "close",
-        },
-        timeout=20,
-    )
-    cookie_dict.update(ent_resp.cookies.get_dict())
-    active_xsrf = unquote(cookie_dict.get("XSRF-TOKEN", "") or "") or unquoted_raw_xsrf
+def _load_upload_credentials() -> tuple[str, str]:
+    cookie = _strip_header_prefix(os.getenv("UPLOADKON_COOKIE", ""), "cookie:")
+    if not cookie:
+        raise PermanentUploadError(
+            "UPLOADKON_COOKIE is not set; cannot upload to UploadKon. Add the secret in repository settings."
+        )
+    xsrf = _strip_header_prefix(os.getenv("UPLOADKON_XSRF_TOKEN", ""), "x-xsrf-token:")
+    return cookie, xsrf
 
-    # Keep Cookie header compact (Laravel only needs aplod_kn_session in Cookie and X-XSRF-TOKEN in header)
-    if "aplod_kn_session" in cookie_dict:
-        post_cookie_str = f"aplod_kn_session={cookie_dict['aplod_kn_session']}"
+
+def _refresh_upload_session(session: requests.Session, cookie: str, raw_xsrf: str,
+                            base_headers: dict[str, str], timeout: float) -> tuple[str, str]:
+    """Bootstrap/refresh the active cookie and XSRF token before uploading."""
+    cookie_dict = _parse_cookie_header(cookie)
+    try:
+        response = session.get(
+            f"{_upload_origin()}/api/v1/drive/file-entries",
+            params={"perPage": 1},
+            headers={**base_headers, "Cookie": cookie, "Connection": "close"},
+            timeout=(UPLOAD_CONNECT_TIMEOUT, min(timeout, 60.0)),
+        )
+    except requests.exceptions.RequestException as exc:
+        # A slow session endpoint must not block the upload itself: fall back to
+        # the configured cookie/token and let the POST decide.
+        print(
+            f"Warning: could not refresh the UploadKon session "
+            f"({type(exc).__name__}: {_one_line(exc)}); using the configured cookie.",
+            file=sys.stderr,
+        )
+        active_xsrf = unquote(cookie_dict.get("XSRF-TOKEN", "") or "") or unquote(raw_xsrf)
+        return cookie, active_xsrf
+
+    if response.status_code in AUTH_HTTP_STATUS:
+        raise RetryableUploadError(
+            f"UploadKon rejected UPLOADKON_COOKIE (HTTP {response.status_code}); "
+            "refresh the UPLOADKON_COOKIE and UPLOADKON_XSRF_TOKEN secrets"
+        )
+    if response.ok:
+        cookie_dict.update(response.cookies.get_dict())
     else:
-        post_cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
-
-    headers = {
-        **base_headers,
-        "Cookie": post_cookie_str,
-        "X-XSRF-TOKEN": active_xsrf,
-        "Connection": "close",
-    }
-
-    with path.open("rb") as handle:
-        response = requests.post(
-            url,
-            headers=headers,
-            data=fields,
-            files={"file": (path.name, handle, "text/plain")},
-            timeout=60,
+        print(
+            f"Warning: UploadKon session refresh returned HTTP {response.status_code}; "
+            "continuing with the configured cookie.",
+            file=sys.stderr,
         )
 
+    active_xsrf = unquote(cookie_dict.get("XSRF-TOKEN", "") or "") or unquote(raw_xsrf)
+    # Laravel only needs aplod_kn_session in Cookie; keep the header compact.
+    if "aplod_kn_session" in cookie_dict:
+        cookie_str = f"aplod_kn_session={cookie_dict['aplod_kn_session']}"
+    else:
+        cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
+    return cookie_str, active_xsrf
+
+
+def _check_upload_response(response: requests.Response) -> dict | list:
+    status = response.status_code
+    snippet = _one_line(response.text[:300])
+    if status in AUTH_HTTP_STATUS:
+        raise RetryableUploadError(
+            f"UploadKon HTTP {status} (session/CSRF rejected): {snippet}"
+        )
+    if status in RETRYABLE_HTTP_STATUS:
+        raise RetryableUploadError(f"UploadKon HTTP {status}: {snippet}")
     if not response.ok:
-        snippet = response.text[:200].replace("\r", " ").replace("\n", " ")
-        raise RuntimeError(f"UploadKon HTTP {response.status_code}: {snippet}")
+        raise PermanentUploadError(f"UploadKon HTTP {status}: {snippet}")
     try:
         result = response.json()
-    except requests.exceptions.JSONDecodeError as exc:
-        raise RuntimeError("Upload endpoint did not return JSON") from exc
+    except ValueError as exc:
+        raise RetryableUploadError(
+            f"upload endpoint did not return JSON: {snippet}"
+        ) from exc
     if not isinstance(result, (dict, list)):
-        raise RuntimeError("Upload endpoint returned an unexpected response")
-    print("Upload completed successfully.")
-    print("::notice::Upload to UploadKon completed successfully.")
+        raise RetryableUploadError("upload endpoint returned an unexpected response")
+    return result
+
+
+UPLOAD_LINK_KEYS = (
+    "url",
+    "link",
+    "downloadUrl",
+    "download_url",
+    "publicUrl",
+    "public_url",
+    "fileUrl",
+    "file_url",
+    "shortUrl",
+    "short_url",
+)
+
+
+def _find_upload_link(payload: object, depth: int = 0) -> str | None:
+    """Best-effort lookup of the uploaded file's public URL in the API response."""
+    if depth > 4:
+        return None
+    if isinstance(payload, dict):
+        for key in UPLOAD_LINK_KEYS:
+            value = payload.get(key)
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                return value
+        for value in payload.values():
+            found = _find_upload_link(value, depth + 1)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for item in payload[:5]:
+            found = _find_upload_link(item, depth + 1)
+            if found:
+                return found
+    return None
+
+
+def _upload_once(path: Path, timeout: float) -> dict | list:
+    """Perform one complete upload attempt (session refresh + multipart POST)."""
+    cookie, raw_xsrf = _load_upload_credentials()
+    base_headers = _upload_base_headers()
+    url = _upload_url()
+
+    session = requests.Session()
+    try:
+        active_cookie, active_xsrf = _refresh_upload_session(
+            session, cookie, raw_xsrf, base_headers, timeout
+        )
+        headers = {
+            **base_headers,
+            "Cookie": active_cookie,
+            "X-XSRF-TOKEN": active_xsrf,
+            "Connection": "close",
+        }
+        # Reopen the file for every attempt so a retry always sends the full body.
+        with path.open("rb") as handle:
+            response = session.post(
+                url,
+                headers=headers,
+                data=_upload_form_fields(),
+                files={"file": (path.name, handle, "text/plain")},
+                timeout=(UPLOAD_CONNECT_TIMEOUT, timeout),
+            )
+        return _check_upload_response(response)
+    finally:
+        session.close()
+
+
+def upload_file(path: Path) -> None:
+    """Upload ``path`` to UploadKon, retrying transient failures several times."""
+    attempts = _positive_int_env("UPLOADKON_MAX_ATTEMPTS", DEFAULT_UPLOAD_ATTEMPTS)
+    timeout = _positive_float_env("UPLOADKON_TIMEOUT", DEFAULT_UPLOAD_TIMEOUT)
+    _configure_tcp_mss()
+
+    print(
+        f"Uploading {path.name} to UploadKon "
+        f"(up to {attempts} attempt(s), {timeout:.0f}s read timeout each)."
+    )
+
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            result = _upload_once(path, timeout)
+        except PermanentUploadError:
+            raise
+        except (RetryableUploadError, OSError) as exc:
+            # Timeouts/resets (requests raises IOError subclasses), 5xx, expired CSRF.
+            last_error = exc
+            message = (
+                f"Upload attempt {attempt}/{attempts} failed: "
+                f"{type(exc).__name__}: {_one_line(exc)}"
+            )
+            print(message, file=sys.stderr)
+            print(f"::warning::{message}", file=sys.stderr)
+            if attempt < attempts:
+                delay = min(
+                    UPLOAD_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+                    UPLOAD_BACKOFF_MAX_SECONDS,
+                )
+                print(f"Retrying the UploadKon upload in {delay:.0f}s ...")
+                time.sleep(delay)
+            continue
+
+        print("Upload completed successfully.")
+        print("::notice::Upload to UploadKon completed successfully.")
+        link = _find_upload_link(result)
+        if link:
+            print(f"::notice::Uploaded file: {link}")
+        return
+
+    raise RuntimeError(
+        f"UploadKon upload failed after {attempts} attempt(s): "
+        f"{type(last_error).__name__}: {_one_line(last_error)}"
+    )
 
 
 def main() -> int:
