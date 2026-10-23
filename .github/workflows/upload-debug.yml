@@ -12,7 +12,7 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -26,79 +26,69 @@ jobs:
           UPLOADKON_XSRF_TOKEN: ${{ secrets.UPLOADKON_XSRF_TOKEN }}
         run: |
           python - <<'PY'
-          import os, socket, sys, time
+          import io, json, os, socket, time, zipfile
           import requests
-
-          def emit(message):
-              # Annotations survive log-download restrictions in this environment.
-              print(f"::notice::{message}")
 
           UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-          payload = b"tg://proxy?server=probe.example&port=443&secret=deadbeef\n"
+          lines = []
 
-          def show(label, response, elapsed, body=True):
-              emit(f"[{label}] HTTP {response.status_code} in {elapsed:.2f}s "
-                    f"content-type={response.headers.get('Content-Type')}")
-              for key in ("server", "cf-ray", "via", "x-powered-by", "content-length"):
-                  if key in response.headers:
-                      emit(f"    {key}: {response.headers[key]}")
+          def log(message):
+              lines.append(str(message).replace("\n", " "))
+              print(message)
+
+          def summarize(response, elapsed, body=True):
+              parts = [f"HTTP {response.status_code} in {elapsed:.2f}s",
+                       f"ct={response.headers.get('Content-Type')}"]
               if body:
-                  emit("    body: " + response.text[:300].replace("\n", " "))
+                  parts.append("body=" + response.text[:400].replace("\n", " "))
+              return " | ".join(parts)
 
-          def probe(name, method, url, **kwargs):
+          def probe(label, session, method, url, **kwargs):
               started = time.time()
               try:
-                  session = requests.Session()
-                  if method == "GET":
-                      response = session.get(url, timeout=(20, 60), **kwargs)
-                  else:
-                      response = session.post(url, timeout=(20, 60), **kwargs)
-                  show(name, response, time.time() - started)
-                  return session
+                  response = getattr(session, method)(url, timeout=(20, 90), **kwargs)
+                  log(f"[{label}] {summarize(response, time.time() - started)}")
+                  return response
               except Exception as exc:
-                  emit(f"[{name}] FAILED after {time.time() - started:.2f}s: "
-                        f"{type(exc).__name__}: {exc}")
+                  log(f"[{label}] FAILED after {time.time() - started:.2f}s: "
+                      f"{type(exc).__name__}: {exc}")
                   return None
 
-          emit("DNS: " + str(socket.gethostbyname_ex("uploadkon.ir")))
-          emit("DNS my: " + str(socket.gethostbyname_ex("my.uploadkon.ir")))
+          def public_upload(name, data, mime="text/plain"):
+              session = requests.Session()
+              headers = {"User-Agent": UA, "Accept": "*/*",
+                         "Accept-Language": "en-US,en;q=0.9",
+                         "X-Requested-With": "XMLHttpRequest",
+                         "Origin": "https://uploadkon.ir",
+                         "Referer": "https://uploadkon.ir/",
+                         "Connection": "close"}
+              return probe(f"public POST {name}", session, "post",
+                           "https://uploadkon.ir/", headers=headers,
+                           data={"submitr": "1", "ajax": "1"},
+                           files={"file": (name, data, mime)})
 
-          headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
-          page = probe("GET uploadkon.ir", "GET", "https://uploadkon.ir/",
-                       headers={**headers, "Accept": "text/html"}, allow_redirects=True)
+          log("DNS uploadkon.ir: " + str(socket.gethostbyname_ex("uploadkon.ir")))
+          log("DNS my.uploadkon.ir: " + str(socket.gethostbyname_ex("my.uploadkon.ir")))
 
-          ajax = {
-              "User-Agent": UA,
-              "Accept": "*/*",
-              "Accept-Language": "en-US,en;q=0.9",
-              "X-Requested-With": "XMLHttpRequest",
-              "Origin": "https://uploadkon.ir",
-              "Referer": "https://uploadkon.ir/",
-              "Connection": "close",
-          }
-          probe("POST uploadkon.ir (tiny)",
-                "POST", "https://uploadkon.ir/",
-                headers=ajax,
-                data={"submitr": "1", "ajax": "1"},
-                files={"file": ("probe.txt", payload, "text/plain")})
+          page = requests.Session()
+          probe("GET uploadkon.ir", page, "get", "https://uploadkon.ir/",
+                headers={"User-Agent": UA, "Accept": "text/html"}, allow_redirects=True)
 
-          # Same request but through the warmed session (with whatever cookies the
-          # homepage set), which is what a browser would do.
-          if page is not None:
-              started = time.time()
-              try:
-                  response = page.post(
-                      "https://uploadkon.ir/", headers=ajax,
-                      data={"submitr": "1", "ajax": "1"},
-                      files={"file": ("probe2.txt", payload, "text/plain")},
-                      timeout=(20, 60))
-                  show("POST uploadkon.ir (warmed)", response, time.time() - started)
-                  emit("    cookies: " + str(page.cookies.get_dict()))
-              except Exception as exc:
-                  emit(f"[POST warmed] FAILED after {time.time() - started:.2f}s: "
-                       f"{type(exc).__name__}: {exc}")
-                  emit("    cookies: " + str(page.cookies.get_dict()))
+          payload = b"tg://proxy?server=probe.example&port=443&secret=deadbeef\n"
+          # Which extensions does the anonymous uploader accept?
+          for name in ("probe.log", "probe.csv", "probe.json", "probe.dat",
+                       "probe.txt.zip", "probe.txt"):
+              if name.endswith(".zip"):
+                  buffer = io.BytesIO()
+                  with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                      archive.writestr("probe.txt", payload)
+                  data = buffer.getvalue()
+                  mime = "application/zip"
+              else:
+                  data = payload
+                  mime = "text/plain"
+              public_upload(name, data, mime)
 
           cookie = (os.getenv("UPLOADKON_COOKIE") or "").strip()
           xsrf = (os.getenv("UPLOADKON_XSRF_TOKEN") or "").strip()
@@ -107,17 +97,21 @@ jobs:
                       "X-Requested-With": "XMLHttpRequest",
                       "Origin": "https://my.uploadkon.ir",
                       "Referer": "https://my.uploadkon.ir/drive"}
-              probe("GET my.uploadkon.ir drive",
-                    "GET", "https://my.uploadkon.ir/api/v1/drive/file-entries",
+              probe("GET my drive", requests.Session(), "get",
+                    "https://my.uploadkon.ir/api/v1/drive/file-entries",
                     headers={**base, "Cookie": cookie}, params={"perPage": 1})
-              probe("POST my.uploadkon.ir upload",
-                    "POST", "https://my.uploadkon.ir/api/v1/file-entries",
+              drive = requests.Session()
+              probe("POST my upload (txt)", drive, "post",
+                    "https://my.uploadkon.ir/api/v1/file-entries",
                     headers={**base, "Cookie": cookie, "X-XSRF-TOKEN": xsrf,
                              "Connection": "close"},
                     data={"clientMime": "text/plain", "clientExtension": "txt",
                           "uploadType": "bedrive", "backendId": "cdc_W8Ekm8",
                           "parentId": "", "workspaceId": "0", "relativePath": ""},
-                    files={"file": ("probe3.txt", payload, "text/plain")})
+                    files={"file": ("probe-drive.txt", payload, "text/plain")})
           else:
-              emit("No UPLOADKON_COOKIE secret; skipping the drive API probes.")
+              log("No UPLOADKON_COOKIE secret; skipping the drive API probes.")
+
+          # One aggregated annotation keeps us under GitHub's 10-per-step limit.
+          print("::notice::PROBE_RESULT " + json.dumps(lines)[:12000])
           PY
