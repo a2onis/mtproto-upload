@@ -608,16 +608,78 @@ def _public_upload_headers() -> dict[str, str]:
     }
 
 
+def _configure_session(session: requests.Session) -> None:
+    """Apply optional proxy/cookie settings shared by both upload endpoints."""
+    proxy = os.getenv("UPLOADKON_PROXY", "").strip()
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+    public_cookie = _strip_header_prefix(os.getenv("UPLOADKON_PUBLIC_COOKIE", ""), "cookie:")
+    if public_cookie:
+        session.cookies.update(_parse_cookie_header(public_cookie))
+
+
+def _public_upload_headers() -> dict[str, str]:
+    url = _public_upload_url()
+    parts = urlsplit(url)
+    origin = f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else url
+    return {
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": origin,
+        "Referer": url,
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+    }
+
+
+def _warm_up_public_session(session: requests.Session, timeout: float) -> None:
+    """Load the upload page first so any session/anti-bot cookie is present."""
+    url = _public_upload_url()
+    warm_headers = {
+        key: value
+        for key, value in _public_upload_headers().items()
+        if key != "X-Requested-With"
+    }
+    warm_headers["Accept"] = (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    )
+    try:
+        response = session.get(
+            url,
+            headers=warm_headers,
+            timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), min(timeout, 60.0)),
+        )
+    except requests.exceptions.RequestException as exc:
+        print(
+            f"Warning: uploadkon.ir page load failed ({type(exc).__name__}: "
+            f"{_one_line(exc)}); continuing with the upload.",
+            file=sys.stderr,
+        )
+        return
+    print(
+        f"uploadkon.ir session warm-up: HTTP {response.status_code}, "
+        f"{len(session.cookies)} cookie(s)."
+    )
+
+
 def _public_upload_once(path: Path, timeout: float) -> dict[str, str]:
     """Upload ``path`` to the public uploadkon.ir endpoint (no login required)."""
     url = _public_upload_url()
     session = requests.Session()
     try:
+        _configure_session(session)
+        _warm_up_public_session(session, timeout)
+        headers = _public_upload_headers()
         # Reopen the file for every attempt so a retry always sends the full body.
         with path.open("rb") as handle:
             response = session.post(
                 url,
-                headers=_public_upload_headers(),
+                headers=headers,
                 data={"submitr": "1", "ajax": "1"},
                 files={"file": (path.name, handle, "text/plain")},
                 timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), timeout),
@@ -633,6 +695,12 @@ def _public_upload_once(path: Path, timeout: float) -> dict[str, str]:
         if not response.ok:
             raise PermanentUploadError(f"uploadkon.ir HTTP {status}: {snippet}")
         return parse_public_upload_response(response.text)
+    except requests.exceptions.ConnectionError as exc:
+        raise RetryableUploadError(
+            f"could not upload to uploadkon.ir ({_one_line(exc)}). "
+            "If this repeats, the runner's IP may be blocked by the host: set the "
+            "UPLOADKON_PROXY repository secret/variable to route through a proxy."
+        ) from exc
     finally:
         session.close()
 
@@ -645,6 +713,7 @@ def _upload_once(path: Path, timeout: float) -> dict | list:
 
     session = requests.Session()
     try:
+        _configure_session(session)
         active_cookie, active_xsrf = _refresh_upload_session(
             session, cookie, raw_xsrf, base_headers, timeout
         )

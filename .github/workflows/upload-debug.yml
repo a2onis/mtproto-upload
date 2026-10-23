@@ -29,18 +29,22 @@ jobs:
           import os, socket, sys, time
           import requests
 
+          def emit(message):
+              # Annotations survive log-download restrictions in this environment.
+              print(f"::notice::{message}")
+
           UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
           payload = b"tg://proxy?server=probe.example&port=443&secret=deadbeef\n"
 
           def show(label, response, elapsed, body=True):
-              print(f"[{label}] HTTP {response.status_code} in {elapsed:.2f}s "
+              emit(f"[{label}] HTTP {response.status_code} in {elapsed:.2f}s "
                     f"content-type={response.headers.get('Content-Type')}")
               for key in ("server", "cf-ray", "via", "x-powered-by", "content-length"):
                   if key in response.headers:
-                      print(f"    {key}: {response.headers[key]}")
+                      emit(f"    {key}: {response.headers[key]}")
               if body:
-                  print("    body:", response.text[:300].replace("\n", " "))
+                  emit("    body: " + response.text[:300].replace("\n", " "))
 
           def probe(name, method, url, **kwargs):
               started = time.time()
@@ -53,12 +57,12 @@ jobs:
                   show(name, response, time.time() - started)
                   return session
               except Exception as exc:
-                  print(f"[{name}] FAILED after {time.time() - started:.2f}s: "
+                  emit(f"[{name}] FAILED after {time.time() - started:.2f}s: "
                         f"{type(exc).__name__}: {exc}")
                   return None
 
-          print("DNS:", socket.gethostbyname_ex("uploadkon.ir"))
-          print("DNS my:", socket.gethostbyname_ex("my.uploadkon.ir"))
+          emit("DNS: " + str(socket.gethostbyname_ex("uploadkon.ir")))
+          emit("DNS my: " + str(socket.gethostbyname_ex("my.uploadkon.ir")))
 
           headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
           page = probe("GET uploadkon.ir", "GET", "https://uploadkon.ir/",
@@ -90,11 +94,11 @@ jobs:
                       files={"file": ("probe2.txt", payload, "text/plain")},
                       timeout=(20, 60))
                   show("POST uploadkon.ir (warmed)", response, time.time() - started)
-                  print("    cookies:", page.cookies.get_dict())
+                  emit("    cookies: " + str(page.cookies.get_dict()))
               except Exception as exc:
-                  print(f"[POST warmed] FAILED after {time.time() - started:.2f}s: "
-                        f"{type(exc).__name__}: {exc}")
-                  print("    cookies:", page.cookies.get_dict())
+                  emit(f"[POST warmed] FAILED after {time.time() - started:.2f}s: "
+                       f"{type(exc).__name__}: {exc}")
+                  emit("    cookies: " + str(page.cookies.get_dict()))
 
           cookie = (os.getenv("UPLOADKON_COOKIE") or "").strip()
           xsrf = (os.getenv("UPLOADKON_XSRF_TOKEN") or "").strip()
@@ -115,5 +119,5 @@ jobs:
                           "parentId": "", "workspaceId": "0", "relativePath": ""},
                     files={"file": ("probe3.txt", payload, "text/plain")})
           else:
-              print("No UPLOADKON_COOKIE secret; skipping the drive API probes.")
+              emit("No UPLOADKON_COOKIE secret; skipping the drive API probes.")
           PY
