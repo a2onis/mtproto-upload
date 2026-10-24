@@ -41,6 +41,9 @@ In **Settings → Secrets and variables → Actions**, add:
 - `UPLOADKON_XSRF_TOKEN` — the XSRF token expected in the `X-XSRF-TOKEN` request header (URL-decode the `XSRF-TOKEN` cookie value if necessary).
 - `UPLOADKON_PUBLIC_COOKIE` — optional; a browser cookie for `uploadkon.ir` if the anonymous endpoint asks for one.
 - `UPLOADKON_PROXY` — optional; HTTP(S) proxy URL used for the upload requests.
+- `UPLOADKON_TRANSPORT_RETRIES` — optional; defaults to `3`. How often a request is re-sent on a fresh socket when the host drops the connection before answering (`('Connection aborted.', RemoteDisconnected(...))`). Only failures where no response byte arrived are re-sent, so an upload is never duplicated. Set to `0` to disable.
+- `UPLOADKON_CONNECTION_CLOSE` — optional; defaults to off. Set to `1` to send `Connection: close` and force a new TCP+TLS handshake per request (the previous behaviour). Keep-alive is the default because it matches what a browser does and needs fewer handshakes.
+- `UPLOADKON_TCP_MSS` — optional; defaults to `1000`, clamping the outgoing TCP MSS to dodge PMTU blackholes on routes to `.ir` hosts. Set to `0` to keep the kernel default if the clamp itself looks like the problem.
 
 UploadKon's browser session credentials expire and may need to be refreshed. Rotate/revoke any session cookies or XSRF values that have been shared outside GitHub Secrets; do not paste credentials into source code, issues, or logs. The request example provided for this project contained session-cookie/XSRF credentials, so invalidate that session and create fresh values before running this workflow.
 
@@ -66,6 +69,8 @@ Per endpoint, the uploader:
 - stays inside an overall `UPLOADKON_TOTAL_TIMEOUT` budget (default 600 s) so retries never outlast the job;
 - fails fast for permanent errors such as `400`/`419` or a rejection with no file link, then moves on to the next endpoint;
 - rebuilds the upload payload for every attempt so a retry always sends the full body;
+- re-sends a request on a fresh socket when the host drops the connection without answering, instead of spending a whole attempt (and its 5-30 s backoff) on it;
+- reports the runner's public egress IP when a host refuses the connection, so the IP can be allowlisted on the host or routed through `UPLOADKON_PROXY`;
 - fetches the returned public link once to confirm it really downloads (a broken link becomes a warning, not a false success);
 - optionally routes through a proxy (`UPLOADKON_PROXY`, e.g. `http://user:pass@host:8080`) if the runner IP is blocked.
 

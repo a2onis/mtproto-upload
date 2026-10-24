@@ -41,6 +41,11 @@ DEFAULT_LOOKBACK_HOURS = 12
 DEFAULT_UPLOAD_ATTEMPTS = 4
 DEFAULT_UPLOAD_TIMEOUT = 120.0
 UPLOAD_CONNECT_TIMEOUT = 30.0
+# Outgoing TCP MSS clamp; 0 disables it (see _configure_tcp_mss).
+DEFAULT_TCP_MSS = 1000
+# Fast transport-level retries for connections the host drops before answering.
+# Cheap (an RST is instant) and it is the failure the UploadKon hosts produce.
+DEFAULT_TRANSPORT_RETRIES = 3
 UPLOAD_BACKOFF_SECONDS = 5.0
 UPLOAD_BACKOFF_MAX_SECONDS = 30.0
 # Overall budget for all endpoints/attempts so retries cannot outlast the CI job.
@@ -394,6 +399,17 @@ def _cookie_header(cookies: dict[str, str]) -> str:
     )
 
 
+def _jar_size(session: object) -> int:
+    """How many cookies the session already holds (0 when it has no real jar)."""
+    jar = getattr(session, "cookies", None)
+    if jar is None:
+        return 0
+    try:
+        return len(jar)
+    except TypeError:  # pragma: no cover - mocks without a sized jar
+        return 0
+
+
 def _one_line(value: object, limit: int = 300) -> str:
     text = str(value).replace("\r", " ").replace("\n", " ")
     text = re.sub(r"\s+", " ", text).strip()
@@ -433,19 +449,91 @@ class RetryableUploadError(UploadError):
 
 
 def _configure_tcp_mss() -> None:
-    """Clamp TCP MSS to 1000 bytes to avoid PMTU blackholes on routes to .ir hosts."""
+    """Clamp the outgoing TCP MSS unless the host route needs full-size segments.
+
+    A 1000-byte MSS avoids PMTU blackholes on some routes to `.ir` hosts, but it
+    is not free: every segment carries more overhead and a middlebox that
+    inspects MSS can treat the connection as unusual. Set
+    ``UPLOADKON_TCP_MSS=0`` to leave the kernel default in place.
+    """
     import socket
 
     from urllib3.connection import HTTPConnection
 
     if not hasattr(socket, "TCP_MAXSEG"):
         return
-    mss_opt = (socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1000)
+    raw = os.getenv("UPLOADKON_TCP_MSS", "").strip().lower()
+    if raw in {"0", "off", "false", "no", "disable", "disabled"}:
+        return
+    try:
+        mss = int(raw) if raw else DEFAULT_TCP_MSS
+    except ValueError:
+        raise ValueError(f"UPLOADKON_TCP_MSS must be an integer or 0, got {raw!r}")
+    if mss < 1:
+        return
+    mss_opt = (socket.IPPROTO_TCP, socket.TCP_MAXSEG, mss)
     if mss_opt not in HTTPConnection.default_socket_options:
         HTTPConnection.default_socket_options = [
             *HTTPConnection.default_socket_options,
             mss_opt,
         ]
+
+
+#: ``Connection: close`` forces a brand-new TCP+TLS handshake for every request.
+#: Browsers keep the socket alive, and hosts that rate-limit handshakes are far
+#: more likely to drop a fresh connection than a reused one, so keep-alive is the
+#: default. Set ``UPLOADKON_CONNECTION_CLOSE=1`` to restore the old behaviour.
+def _connection_headers() -> dict[str, str]:
+    raw = os.getenv("UPLOADKON_CONNECTION_CLOSE", "").strip().lower()
+    return {"Connection": "close"} if raw in {"1", "true", "yes", "on"} else {}
+
+
+_EGRESS_IP: str | None = None
+
+
+def _egress_ip(timeout: float = 8.0) -> str:
+    """Best-effort public IP of this runner, so a block can be reported precisely."""
+    global _EGRESS_IP
+    if _EGRESS_IP:
+        return _EGRESS_IP
+    probe = requests.Session()
+    try:
+        _configure_session(probe)
+        response = probe.get(
+            os.getenv("UPLOADKON_EGRESS_IP_URL") or "https://api.ipify.org?format=json",
+            headers={"Accept": "application/json",
+                     "User-Agent": _public_upload_headers()["User-Agent"]},
+            timeout=timeout,
+        )
+        try:
+            ip = str(response.json().get("ip", "")).strip()
+        except ValueError:
+            ip = response.text.strip()[:64]
+    except Exception:  # pragma: no cover - the probe must never break an upload
+        ip = ""
+    finally:
+        probe.close()
+    _EGRESS_IP = ip or "unknown"
+    return _EGRESS_IP
+
+
+def _describe_connection_failure(host: str, exc: Exception) -> str:
+    """Explain a dropped connection in terms the operator can act on.
+
+    The actionable part comes first: the collected summary is truncated, so the
+    egress IP and the proxy hint must not sit at the end.
+    """
+    text = _one_line(exc)
+    dropped = "RemoteDisconnected" in text or "Connection aborted" in text
+    what = "closed the connection without sending any response"
+    if not dropped:
+        what = "could not be reached"
+    return (
+        f"{host} {what}. This is the host refusing the runner, not a bug in the "
+        f"request: retrying will not help. Runner egress IP: {_egress_ip()} - set "
+        "UPLOADKON_PROXY to route through a proxy or allowlist that IP on the host. "
+        f"Detail: {text}"
+    )
 
 
 def _upload_url() -> str:
@@ -513,8 +601,8 @@ def _refresh_upload_session(session: requests.Session, cookie: str, raw_xsrf: st
         response = session.get(
             url,
             params={"perPage": 1},
-            headers={**base_headers, "Cookie": _cookie_header(cookie_dict),
-                     "Connection": "close"},
+            headers={**base_headers, **_connection_headers(),
+                     "Cookie": _cookie_header(cookie_dict)},
             timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), min(timeout, 60.0)),
         )
     except requests.exceptions.RequestException as exc:
@@ -725,24 +813,78 @@ def _public_upload_url() -> str:
     return os.getenv("UPLOADKON_PUBLIC_URL") or DEFAULT_PUBLIC_UPLOAD_URL
 
 
-def _public_upload_headers() -> dict[str, str]:
-    url = _public_upload_url()
-    parts = urlsplit(url)
-    origin = f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else url
-    return {
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": origin,
-        "Referer": url,
-        "Connection": "close",
-        "Pragma": "no-cache",
-        "Cache-Control": "no-cache",
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        ),
-    }
+def _upload_host(url: str) -> str:
+    """Human-readable host of ``url`` for log messages."""
+    parts = urlsplit(url or "")
+    return parts.netloc or parts.path or (url or "the upload host")
+
+
+def _make_retry_policy(retries: int):
+    """Retry only the failures that cannot have reached the server.
+
+    ``('Connection aborted.', RemoteDisconnected(...))`` arrives as a urllib3
+    ``ProtocolError``. urllib3 counts that as a *read* failure, so a plain
+    ``Retry(read=0)`` never retries it - which is exactly the error the UploadKon
+    hosts produce. We retry it here, but only while no response byte has been
+    received; once the server has started answering, a resend could create a
+    duplicate file, so that case is left to the outer attempt loop.
+    """
+    from urllib3.exceptions import MaxRetryError, ProtocolError
+    from urllib3.util.retry import Retry, RequestHistory
+
+    class DroppedConnectionRetry(Retry):
+        def is_retry(self, method, status_code, has_retry_after=False):  # noqa: D102
+            if method.upper() in self.allowed_methods:
+                return True
+            return super().is_retry(method, status_code, has_retry_after)
+
+        def increment(self, method=None, url=None, response=None, error=None,
+                      _pool=None, _stacktrace=None):
+            if error is None or not isinstance(error, ProtocolError):
+                return super().increment(method, url, response, error, _pool,
+                                         _stacktrace)
+            cause = error.args[1] if len(error.args) > 1 else None
+            if not isinstance(
+                cause, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+            ):
+                # Not a dropped connection (e.g. a genuine read problem).
+                raise error
+            if response is not None and getattr(response, "closed", True) is False:
+                # Bytes already came back: never resend an upload blindly.
+                raise error
+            # Mirror urllib3's own bookkeeping, including the "check exhausted
+            # *before* decrementing" order: Retry.new() turns a 0 total into
+            # False, which would mean "retry forever".
+            if self.is_exhausted():
+                raise MaxRetryError(_pool, url, reason=error) from error
+            total = self.total
+            if total is not False and total is not None:
+                total -= 1
+            new_retry = self.new(
+                total=total,
+                connect=self.connect,
+                read=self.read,
+                redirect=self.redirect,
+                status=self.status,
+                other=self.other,
+                history=self.history + (RequestHistory(method, url, error, None, None),),
+            )
+            return new_retry
+
+    try:
+        return DroppedConnectionRetry(
+            total=retries, connect=retries, read=0, status=0, redirect=0,
+            backoff_factor=0.3,
+            allowed_methods=frozenset({"GET", "HEAD", "POST"}),
+            raise_on_status=False,
+        )
+    except TypeError:  # pragma: no cover - urllib3 < 1.26
+        return DroppedConnectionRetry(
+            total=retries, connect=retries, read=0, status=0, redirect=0,
+            backoff_factor=0.3,
+            method_whitelist=frozenset({"GET", "HEAD", "POST"}),
+            raise_on_status=False,
+        )
 
 
 def _configure_session(session: requests.Session) -> None:
@@ -753,6 +895,28 @@ def _configure_session(session: requests.Session) -> None:
     public_cookie = _strip_header_prefix(os.getenv("UPLOADKON_PUBLIC_COOKIE", ""), "cookie:")
     if public_cookie:
         session.cookies.update(_parse_cookie_header(public_cookie))
+    retries = _transport_retries()
+    if retries > 0:
+        # A dropped connection costs milliseconds to retry on a fresh socket, so
+        # do it below requests instead of burning an outer attempt (and its 5-30 s
+        # backoff) on it.
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4,
+            pool_maxsize=4,
+            max_retries=_make_retry_policy(retries),
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
+
+def _transport_retries() -> int:
+    raw = os.getenv("UPLOADKON_TRANSPORT_RETRIES", "").strip()
+    if not raw:
+        return DEFAULT_TRANSPORT_RETRIES
+    try:
+        return max(0, int(raw))
+    except ValueError as exc:
+        raise ValueError(f"UPLOADKON_TRANSPORT_RETRIES must be an integer, got {raw!r}") from exc
 
 
 def _public_upload_headers() -> dict[str, str]:
@@ -765,7 +929,7 @@ def _public_upload_headers() -> dict[str, str]:
         "X-Requested-With": "XMLHttpRequest",
         "Origin": origin,
         "Referer": url,
-        "Connection": "close",
+        **_connection_headers(),
         "Pragma": "no-cache",
         "Cache-Control": "no-cache",
         "User-Agent": (
@@ -778,6 +942,11 @@ def _public_upload_headers() -> dict[str, str]:
 def _warm_up_public_session(session: requests.Session, timeout: float) -> None:
     """Load the upload page first so any session/anti-bot cookie is present."""
     url = _public_upload_url()
+    if _jar_size(session):
+        # A previous attempt already collected the host's cookies; skip the extra
+        # request and reuse the warm connection instead.
+        print("uploadkon.ir session warm-up skipped: reusing the cookies already held.")
+        return
     warm_headers = {
         key: value
         for key, value in _public_upload_headers().items()
@@ -853,9 +1022,7 @@ def _public_upload_once(path: Path, timeout: float,
         return parse_public_upload_response(response.text)
     except requests.exceptions.ConnectionError as exc:
         raise RetryableUploadError(
-            f"could not upload to uploadkon.ir ({_one_line(exc)}). "
-            "If this repeats, the runner's IP may be blocked by the host: set the "
-            "UPLOADKON_PROXY repository secret/variable to route through a proxy."
+            _describe_connection_failure(_upload_host(url), exc)
         ) from exc
     finally:
         if http is None:
@@ -885,7 +1052,7 @@ def _upload_once(path: Path, timeout: float,
             # Send every cookie we hold: the session cookie the API authenticates
             # with plus the XSRF-TOKEN the server rotated in its last response.
             "Cookie": _cookie_header(active_cookies),
-            "Connection": "close",
+            **_connection_headers(),
         }
         if active_xsrf:
             headers["X-XSRF-TOKEN"] = active_xsrf
@@ -1037,9 +1204,19 @@ def _upload_attempts(target: str, path: Path, attempts: int, timeout: float,
         except (RetryableUploadError, OSError) as exc:
             # Timeouts/resets (requests raises IOError subclasses), 5xx, expired CSRF.
             last_error = exc
+            detail = _one_line(exc)
+            if not isinstance(exc, UploadError) and isinstance(
+                exc, requests.exceptions.ConnectionError
+            ):
+                # A dropped connection is an operator problem, not a transient one.
+                detail = _describe_connection_failure(
+                    _upload_host(_public_upload_url() if target == "public"
+                                 else _upload_url()),
+                    exc,
+                )
             message = (
                 f"Upload attempt {attempt}/{attempts} via {target} failed: "
-                f"{type(exc).__name__}: {_one_line(exc)}"
+                f"{type(exc).__name__}: {detail}"
             )
             print(message, file=sys.stderr)
             print(f"::warning::{message}", file=sys.stderr)

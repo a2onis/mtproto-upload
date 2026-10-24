@@ -481,6 +481,259 @@ class ResponseCookieCarryoverTests(unittest.TestCase):
             )
 
 
+@unittest.skipUnless(HAS_REQUESTS, "requests is not installed")
+class DroppedConnectionTests(unittest.TestCase):
+    """uploadkon.ir/my.uploadkon.ir answer some requests by closing the socket."""
+
+    def test_requests_keep_the_connection_alive_by_default(self):
+        import os
+        from unittest import mock
+
+        from fetch_and_upload import _public_upload_headers, _upload_base_headers
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("UPLOADKON_CONNECTION_CLOSE", None)
+            self.assertNotIn("Connection", _public_upload_headers())
+            self.assertNotIn("Connection", _upload_base_headers())
+
+        with mock.patch.dict(os.environ, {"UPLOADKON_CONNECTION_CLOSE": "1"}):
+            self.assertEqual(_public_upload_headers()["Connection"], "close")
+
+    def test_session_retries_a_connection_the_host_drops(self):
+        import os
+        from unittest import mock
+
+        import requests
+
+        from fetch_and_upload import _configure_session
+
+        with mock.patch.dict(os.environ, {"UPLOADKON_TRANSPORT_RETRIES": "2"}):
+            session = requests.Session()
+            _configure_session(session)
+
+        adapter = session.get_adapter("https://my.uploadkon.ir/api/v1/file-entries")
+        retry = adapter.max_retries
+        self.assertEqual(retry.connect, 2)
+        self.assertEqual(retry.total, 2)
+        # Read timeouts belong to the outer attempt loop, not the transport.
+        self.assertEqual(retry.read, 0)
+        self.assertIn("POST", retry.allowed_methods)
+
+    def test_transport_retries_can_be_disabled(self):
+        import os
+        from unittest import mock
+
+        import requests
+
+        from fetch_and_upload import _configure_session
+
+        with mock.patch.dict(os.environ, {"UPLOADKON_TRANSPORT_RETRIES": "0"}):
+            session = requests.Session()
+            _configure_session(session)
+
+        adapter = session.get_adapter("https://uploadkon.ir/")
+        # An int max_retries means "no transport retry at all".
+        self.assertEqual(adapter.max_retries.total, 0)
+        self.assertIsNone(adapter.max_retries.connect)
+
+    def test_mss_clamp_can_be_disabled(self):
+        import os
+        from unittest import mock
+
+        from urllib3.connection import HTTPConnection
+
+        from fetch_and_upload import _configure_tcp_mss
+
+        import socket
+
+        clamp = (socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1000)
+        original = list(HTTPConnection.default_socket_options)
+        self.addCleanup(
+            setattr, HTTPConnection, "default_socket_options", original
+        )
+
+        with mock.patch.dict(os.environ, {"UPLOADKON_TCP_MSS": "0"}):
+            _configure_tcp_mss()
+        self.assertNotIn(clamp, HTTPConnection.default_socket_options)
+
+        with mock.patch.dict(os.environ, {"UPLOADKON_TCP_MSS": "1000"}):
+            _configure_tcp_mss()
+        self.assertIn(clamp, HTTPConnection.default_socket_options)
+
+    def test_warm_up_is_skipped_when_cookies_are_already_held(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        import requests
+
+        from fetch_and_upload import upload_file
+
+        body = (
+            '[{"message_content": "<textarea id=\\"file1\\">'
+            "https://uploadkon.ir/uploads/p.txt</textarea></textarea>\"}]"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mtproto-proxies-test.txt"
+            path.write_text("tg://proxy?server=a&port=443&secret=b\n", encoding="utf-8")
+
+            jar = requests.cookies.RequestsCookieJar()
+            jar.set("anti_bot", "1")
+            session = mock.MagicMock()
+            session.cookies = jar
+            session.post.return_value = _FakeResponse(200, text=body)
+
+            with mock.patch.dict(os.environ, {"UPLOADKON_MODE": "public"}), \
+                    mock.patch("fetch_and_upload.requests.Session", return_value=session), \
+                    mock.patch("builtins.print"):
+                upload_file(path)
+
+        # No warm-up page load: the only GET is verify_public_link on the result.
+        warm_up_calls = [
+            call for call in session.get.call_args_list
+            if call.args and call.args[0].rstrip("/") == "https://uploadkon.ir"
+        ]
+        self.assertEqual(warm_up_calls, [])
+        session.post.assert_called_once()
+
+
+@unittest.skipUnless(HAS_REQUESTS, "requests is not installed")
+class DroppedSocketEndToEndTests(unittest.TestCase):
+    """A real server that RSTs the first request must be survived by the retry."""
+
+    def test_upload_succeeds_after_the_first_upload_post_is_dropped(self):
+        import os
+        import socket
+        import tempfile
+        import threading
+        from pathlib import Path
+        from unittest import mock
+
+        from fetch_and_upload import upload_file
+
+        state = {"posts": 0}
+
+        class Handler:
+            def __init__(self, conn):
+                self.conn = conn
+
+            def serve(self):
+                try:
+                    data = b""
+                    while b"\r\n\r\n" not in data:
+                        chunk = self.conn.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                    first = data.startswith(b"POST")
+                    if first:
+                        state["posts"] += 1
+                        first = state["posts"] == 1
+                    if first:
+                        # Reproduce "('Connection aborted.', RemoteDisconnected(...))":
+                        # close without sending a single byte of HTTP.
+                        self.conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                             __import__("struct").pack("ii", 1, 0))
+                        self.conn.close()
+                        return
+                    body = (
+                        b'[{"message_content": "<textarea id=\\"file1\\">'
+                        b"https://uploadkon.ir/uploads/ok.txt</textarea>\"}]"
+                    )
+                    self.conn.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+                    )
+                finally:
+                    try:
+                        self.conn.close()
+                    except OSError:
+                        pass
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(16)
+        port = listener.getsockname()[1]
+
+        def accept_loop():
+            for _ in range(16):
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                threading.Thread(target=Handler(conn).serve, daemon=True).start()
+
+        threading.Thread(target=accept_loop, daemon=True).start()
+        self.addCleanup(listener.close)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mtproto-proxies-test.txt"
+            path.write_text("tg://proxy?server=a&port=443&secret=b\n", encoding="utf-8")
+            env = {
+                "UPLOADKON_MODE": "public",
+                "UPLOADKON_PUBLIC_URL": f"http://127.0.0.1:{port}/",
+                "UPLOADKON_PUBLIC_ARCHIVE": "1",
+                "UPLOADKON_TRANSPORT_RETRIES": "2",
+                "UPLOADKON_CONNECTION_CLOSE": "1",
+                "UPLOADKON_MAX_ATTEMPTS": "1",
+            }
+            with mock.patch.dict(os.environ, env), mock.patch("builtins.print"):
+                upload_file(path)
+
+        # Only one outer attempt was allowed, so the recovery had to happen
+        # below requests: the upload POST was sent twice on two sockets.
+        self.assertEqual(state["posts"], 2)
+
+    def test_repeatedly_dropped_connection_reports_the_runner_ip(self):
+        import os
+        import socket
+        import tempfile
+        import threading
+        from pathlib import Path
+        from unittest import mock
+
+        from fetch_and_upload import upload_file
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+
+        def accept_loop():
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                __import__("struct").pack("ii", 1, 0))
+                conn.close()
+
+        threading.Thread(target=accept_loop, daemon=True).start()
+        self.addCleanup(listener.close)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mtproto-proxies-test.txt"
+            path.write_text("tg://proxy?server=a&port=443&secret=b\n", encoding="utf-8")
+            env = {
+                "UPLOADKON_MODE": "public",
+                "UPLOADKON_PUBLIC_URL": f"http://127.0.0.1:{port}/",
+                "UPLOADKON_TRANSPORT_RETRIES": "1",
+                "UPLOADKON_MAX_ATTEMPTS": "1",
+            }
+            with mock.patch.dict(os.environ, env), mock.patch("builtins.print"), \
+                    mock.patch("fetch_and_upload._egress_ip", return_value="203.0.113.7"):
+                with self.assertRaises(RuntimeError) as ctx:
+                    upload_file(path)
+
+        message = str(ctx.exception)
+        self.assertIn("203.0.113.7", message)
+        self.assertIn("UPLOADKON_PROXY", message)
+
+
 class PublicResponseParsingTests(unittest.TestCase):
     def test_extracts_direct_and_delete_links(self):
         from fetch_and_upload import parse_public_upload_response

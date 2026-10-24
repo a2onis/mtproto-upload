@@ -45,6 +45,16 @@ jobs:
       UPLOADKON_MAX_ATTEMPTS: ${{ vars.UPLOADKON_MAX_ATTEMPTS || '4' }}
       UPLOADKON_TIMEOUT: ${{ vars.UPLOADKON_TIMEOUT || '120' }}
       UPLOADKON_TOTAL_TIMEOUT: ${{ vars.UPLOADKON_TOTAL_TIMEOUT || '600' }}
+      # Re-send on a fresh socket when the host drops the connection before
+      # answering ("Remote end closed connection without response").
+      UPLOADKON_TRANSPORT_RETRIES: ${{ vars.UPLOADKON_TRANSPORT_RETRIES || '3' }}
+      # 1 = send "Connection: close" (new handshake per request); default keeps
+      # the connection alive like a browser does.
+      UPLOADKON_CONNECTION_CLOSE: ${{ vars.UPLOADKON_CONNECTION_CLOSE }}
+      # Outgoing TCP MSS clamp; 0 keeps the kernel default.
+      UPLOADKON_TCP_MSS: ${{ vars.UPLOADKON_TCP_MSS || '1000' }}
+      # Route the upload through a proxy when the runner IP is blocked.
+      UPLOADKON_PROXY: ${{ secrets.UPLOADKON_PROXY }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
