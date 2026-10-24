@@ -51,6 +51,9 @@ UPLOAD_BACKOFF_MAX_SECONDS = 30.0
 # Overall budget for all endpoints/attempts so retries cannot outlast the CI job.
 DEFAULT_TOTAL_UPLOAD_TIMEOUT = 600.0
 MIN_ATTEMPT_SECONDS = 10.0
+# Share of the remaining budget kept back for the next endpoint, so a host that
+# ignores every request cannot starve the fallback endpoint entirely.
+RESERVE_FOR_NEXT_ENDPOINT = 0.4
 RETRYABLE_HTTP_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 AUTH_HTTP_STATUS = frozenset({401, 403, 419})
 MAX_WEB_PAGES_PER_CHANNEL = 25
@@ -518,10 +521,12 @@ def _egress_ip(timeout: float = 8.0) -> str:
 
 
 def _describe_connection_failure(host: str, exc: Exception) -> str:
-    """Explain a dropped connection in terms the operator can act on.
+    """Describe a dropped connection without guessing at its cause.
 
-    The actionable part comes first: the collected summary is truncated, so the
-    egress IP and the proxy hint must not sit at the end.
+    The actionable part comes first because the collected summary is truncated.
+    Whether the host refuses *this runner* or only *this kind of request* is not
+    something a failed request can tell us, so say what happened and point at the
+    probe that can.
     """
     text = _one_line(exc)
     dropped = "RemoteDisconnected" in text or "Connection aborted" in text
@@ -529,9 +534,10 @@ def _describe_connection_failure(host: str, exc: Exception) -> str:
     if not dropped:
         what = "could not be reached"
     return (
-        f"{host} {what}. This is the host refusing the runner, not a bug in the "
-        f"request: retrying will not help. Runner egress IP: {_egress_ip()} - set "
-        "UPLOADKON_PROXY to route through a proxy or allowlist that IP on the host. "
+        f"{host} {what}. Runner egress IP: {_egress_ip()}. Run "
+        "`python fetch_and_upload.py --diagnose-upload` to find out which request "
+        "the host drops, and set UPLOADKON_PROXY to route around it if the host "
+        "refuses this runner. "
         f"Detail: {text}"
     )
 
@@ -1110,6 +1116,88 @@ def _upload_target_once(target: str, path: Path, timeout: float,
     return _upload_once(path, timeout, http)
 
 
+DIAGNOSE_FILENAME = "mtproto-proxies-probe.txt"
+
+
+def diagnose_upload(timeout: float = 30.0) -> bool:
+    """Work out which request an upload host drops, and say so plainly.
+
+    A failed upload cannot tell us whether the host refuses this runner, or only
+    this kind of request. So send progressively closer approximations of the real
+    upload and report the first one that gets no answer:
+
+    1. plain GET of the upload page
+    2. the same GET with the uploader's full header set
+    3. a small form POST (no file)
+    4. the multipart upload itself
+    """
+    public_url = _public_upload_url()
+    drive_url = _upload_url()
+    base = _public_upload_headers()
+    page_headers = {
+        key: value for key, value in base.items() if key != "X-Requested-With"
+    }
+    page_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        probe_path = Path(tmp) / DIAGNOSE_FILENAME
+        probe_path.write_text(
+            "tg://proxy?server=probe.example&port=443&secret=probe\n", encoding="utf-8"
+        )
+        archive, archive_name = build_archive(probe_path)
+    steps = [
+        (f"GET  {public_url} (plain page load)",
+         {"method": "GET", "url": public_url, "headers": {"Accept": "*/*"}}),
+        (f"GET  {public_url} (uploader headers + page cookies)",
+         {"method": "GET", "url": public_url, "headers": page_headers}),
+        (f"POST {public_url} (form only, no file)",
+         {"method": "POST", "url": public_url, "headers": base,
+          "data": {"submitr": "1", "ajax": "1"}}),
+        (f"POST {public_url} (multipart upload of {archive_name}, {len(archive)} bytes)",
+         {"method": "POST", "url": public_url, "headers": base,
+          "data": {"submitr": "1", "ajax": "1"},
+          "files": {"file": (archive_name, archive, "application/zip")}}),
+        (f"GET  {drive_url} (drive API session probe)",
+         {"method": "GET", "url": drive_url, "params": {"perPage": 1},
+          "headers": _upload_base_headers()}),
+    ]
+
+    session = requests.Session()
+    _configure_session(session)
+    results: list[tuple[str, str]] = []
+    print(f"Runner egress IP: {_egress_ip()}")
+    try:
+        for label, kwargs in steps:
+            try:
+                response = session.request(
+                    timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), timeout), **kwargs
+                )
+            except requests.exceptions.RequestException as exc:
+                results.append((label, f"FAILED ({type(exc).__name__}: {_one_line(exc, 120)})"))
+                break
+            results.append((
+                label,
+                f"answered HTTP {response.status_code} ({len(response.content)} bytes)",
+            ))
+    finally:
+        session.close()
+
+    print("\nUpload host probe (first failure is the interesting one):")
+    for label, outcome in results:
+        print(f"  [{'ok  ' if outcome.startswith('answered') else 'FAIL'}] {label}\n         -> {outcome}")
+    if all(outcome.startswith("answered") for _, outcome in results):
+        print("\nEvery probe was answered, so the host accepts these requests from "
+              "this runner. A failing upload is therefore about the real request "
+              "or a transient host problem, not a blanket block.")
+        return True
+    print("\nThe host stopped answering at the request above. Compare it with the "
+          "one before it to see what it objects to (headers, POST body, multipart "
+          "upload, or the drive API), and use UPLOADKON_PROXY if it is this "
+          "runner's IP that is refused.")
+    return False
+
+
 def verify_public_link(url: str, timeout: float = 60.0) -> bool:
     """Fetch the returned link once so a broken upload is not reported as success."""
     session = requests.Session()
@@ -1264,8 +1352,23 @@ def upload_file(path: Path) -> None:
     failures: list[str] = []
     permanent_only = True
     for index, target in enumerate(targets):
+        # Never let one endpoint consume the whole budget: the next endpoint must
+        # still get a real turn. The last one may use whatever is left.
+        remaining_total = deadline - time.monotonic()
+        if index + 1 < len(targets):
+            target_deadline = time.monotonic() + max(
+                MIN_ATTEMPT_SECONDS, remaining_total * (1.0 - RESERVE_FOR_NEXT_ENDPOINT)
+            )
+            print(
+                f"Allowing {max(0.0, target_deadline - time.monotonic()):.0f}s for the "
+                f"{target} endpoint; reserving "
+                f"{RESERVE_FOR_NEXT_ENDPOINT:.0%} of the remaining budget for "
+                f"{targets[index + 1]}."
+            )
+        else:
+            target_deadline = deadline
         try:
-            _try_upload_target(target, path, attempts, timeout, deadline)
+            _try_upload_target(target, path, attempts, timeout, min(target_deadline, deadline))
         except UploadError as exc:
             permanent_only = permanent_only and isinstance(exc, PermanentUploadError)
             failures.append(f"{target}: {type(exc).__name__}: {_one_line(exc)}")
@@ -1288,13 +1391,27 @@ def upload_file(path: Path) -> None:
                 file=sys.stderr,
             )
 
+    if _diagnose_on_failure():
+        try:
+            diagnose_upload()
+        except Exception as exc:  # pragma: no cover - diagnostics must not mask the failure
+            print(f"Upload host probe could not run: {type(exc).__name__}: {_one_line(exc)}",
+                  file=sys.stderr)
+
     summary = "UploadKon upload failed for every endpoint: " + " | ".join(failures)
     if permanent_only:
         raise PermanentUploadError(summary)
     raise RuntimeError(summary)
 
 
+def _diagnose_on_failure() -> bool:
+    raw = os.getenv("UPLOADKON_DIAGNOSE_ON_FAILURE", "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 def main() -> int:
+    if "--diagnose-upload" in sys.argv[1:]:
+        return 0 if diagnose_upload() else 1
     channel_ids = [
         item.strip()
         for item in re.split(r"[,\s]+", os.getenv("CHANNEL_IDS", ""))

@@ -734,6 +734,182 @@ class DroppedSocketEndToEndTests(unittest.TestCase):
         self.assertIn("UPLOADKON_PROXY", message)
 
 
+@unittest.skipUnless(HAS_REQUESTS, "requests is not installed")
+class DiagnoseUploadTests(unittest.TestCase):
+    """The probe must name the request the host drops, not guess at the cause."""
+
+    def _server(self, drop_post):
+        import http.server
+        import socket
+        import socketserver
+        import struct
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _send(self):
+                body = b'{"ok": true}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _drain(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+
+            def do_GET(self):
+                self._drain()
+                self._send()
+
+            def do_POST(self):
+                self._drain()
+                if drop_post:
+                    self.close_connection = True
+                    self.connection.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                    )
+                    self.connection.close()
+                    return
+                self._send()
+
+            def log_message(self, *args):
+                pass
+
+        class Server(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        server = Server(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        return f"http://127.0.0.1:{server.server_address[1]}/"
+
+    def test_probe_reports_the_step_where_the_host_stops_answering(self):
+        import os
+        from unittest import mock
+
+        from fetch_and_upload import diagnose_upload
+
+        url = self._server(drop_post=True)
+        with mock.patch.dict(os.environ, {"UPLOADKON_PUBLIC_URL": url,
+                                          "UPLOADKON_URL": url + "api/v1/file-entries"}), \
+                mock.patch("fetch_and_upload._egress_ip", return_value="203.0.113.9"), \
+                mock.patch("builtins.print") as printed:
+            self.assertFalse(diagnose_upload(timeout=10))
+
+        output = "\n".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        # GETs were answered; the first unanswered request is a POST.
+        self.assertIn("answered HTTP 200", output)
+        self.assertIn("FAIL", output)
+        self.assertIn("POST", output)
+        # The cause must not be asserted - only the observable behaviour.
+        self.assertNotIn("host refusing the runner", output)
+
+    def test_probe_reports_success_when_everything_is_answered(self):
+        import os
+        from unittest import mock
+
+        from fetch_and_upload import diagnose_upload
+
+        url = self._server(drop_post=False)
+        with mock.patch.dict(os.environ, {"UPLOADKON_PUBLIC_URL": url,
+                                          "UPLOADKON_URL": url + "api/v1/file-entries"}), \
+                mock.patch("fetch_and_upload._egress_ip", return_value="203.0.113.9"), \
+                mock.patch("builtins.print"):
+            self.assertTrue(diagnose_upload(timeout=10))
+
+    def test_connection_failure_message_does_not_claim_the_host_is_blocking(self):
+        from unittest import mock
+
+        import requests
+
+        from fetch_and_upload import _describe_connection_failure
+
+        exc = requests.exceptions.ConnectionError(
+            "('Connection aborted.', RemoteDisconnected('Remote end closed connection "
+            "without response'))"
+        )
+        with mock.patch("fetch_and_upload._egress_ip", return_value="203.0.113.9"):
+            message = _describe_connection_failure("uploadkon.ir", exc)
+
+        self.assertIn("203.0.113.9", message)
+        self.assertIn("--diagnose-upload", message)
+        self.assertNotIn("not a bug in the request", message)
+
+
+@unittest.skipUnless(HAS_REQUESTS, "requests is not installed")
+class EndpointBudgetTests(unittest.TestCase):
+    """A host that ignores every request must not starve the fallback endpoint."""
+
+    def test_fallback_endpoint_still_gets_budget_after_the_first_one_burns_it(self):
+        import os
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest import mock
+
+        from fetch_and_upload import upload_file
+
+        allowances: list[float] = []
+
+        def fake_try(target, path, attempts, timeout, deadline):
+            allowances.append(deadline - time.monotonic())
+            if target == "public":
+                # Simulate the public endpoint burning every second it was given.
+                time.sleep(0.2)
+                raise RuntimeError("public upload failed after 4 attempt(s)")
+            raise RuntimeError("drive upload failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mtproto-proxies-test.txt"
+            path.write_text("tg://proxy?server=a&port=443&secret=b\n", encoding="utf-8")
+            env = {
+                "UPLOADKON_MODE": "auto",
+                "UPLOADKON_COOKIE": "aplod_kn_session=abc",
+                "UPLOADKON_TOTAL_TIMEOUT": "600",
+                "UPLOADKON_DIAGNOSE_ON_FAILURE": "0",
+            }
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch("fetch_and_upload._try_upload_target", side_effect=fake_try), \
+                    mock.patch("builtins.print"):
+                with self.assertRaises(RuntimeError):
+                    upload_file(path)
+
+        self.assertEqual(len(allowances), 2)
+        # The first endpoint is capped so it cannot eat the whole budget, and the
+        # last one may use everything that is left. Before the fix the second
+        # endpoint received a negative allowance ("-21s of the upload budget").
+        self.assertGreater(allowances[0], 0)
+        self.assertLess(allowances[0], 600)
+        self.assertGreater(allowances[1], 100)
+
+    def test_probe_runs_when_every_endpoint_fails(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from fetch_and_upload import upload_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mtproto-proxies-test.txt"
+            path.write_text("tg://proxy?server=a&port=443&secret=b\n", encoding="utf-8")
+            env = {"UPLOADKON_MODE": "public", "UPLOADKON_MAX_ATTEMPTS": "1"}
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch("fetch_and_upload._try_upload_target",
+                               side_effect=RuntimeError("nope")), \
+                    mock.patch("fetch_and_upload.diagnose_upload", return_value=True) as probe, \
+                    mock.patch("builtins.print"):
+                with self.assertRaises(RuntimeError):
+                    upload_file(path)
+
+        probe.assert_called_once()
+
+
 class PublicResponseParsingTests(unittest.TestCase):
     def test_extracts_direct_and_delete_links(self):
         from fetch_and_upload import parse_public_upload_response

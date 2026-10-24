@@ -44,6 +44,13 @@ In **Settings → Secrets and variables → Actions**, add:
 - `UPLOADKON_TRANSPORT_RETRIES` — optional; defaults to `3`. How often a request is re-sent on a fresh socket when the host drops the connection before answering (`('Connection aborted.', RemoteDisconnected(...))`). Only failures where no response byte arrived are re-sent, so an upload is never duplicated. Set to `0` to disable.
 - `UPLOADKON_CONNECTION_CLOSE` — optional; defaults to off. Set to `1` to send `Connection: close` and force a new TCP+TLS handshake per request (the previous behaviour). Keep-alive is the default because it matches what a browser does and needs fewer handshakes.
 - `UPLOADKON_TCP_MSS` — optional; defaults to `1000`, clamping the outgoing TCP MSS to dodge PMTU blackholes on routes to `.ir` hosts. Set to `0` to keep the kernel default if the clamp itself looks like the problem.
+- `UPLOADKON_DIAGNOSE_ON_FAILURE` — optional; defaults to on. When every endpoint fails, run the upload host probe and print which request the host stopped answering. Set to `0` to skip it.
+
+`UPLOADKON_TOTAL_TIMEOUT` is now split between endpoints: the first one may use at most 60 % of the remaining budget, so a host that ignores every request cannot leave the fallback endpoint with nothing (`only -21s of the configured upload budget remain`).
+
+### Diagnosing a host that drops requests
+
+`python fetch_and_upload.py --diagnose-upload` sends progressively closer approximations of the real upload and prints the first one the host does not answer: a plain page `GET`, the same `GET` with the uploader's headers, a form-only `POST`, the multipart upload, and the drive API. That distinguishes "the host refuses this runner" from "the host objects to this request", which a failed upload on its own cannot tell you. It exits non-zero when a probe goes unanswered.
 
 UploadKon's browser session credentials expire and may need to be refreshed. Rotate/revoke any session cookies or XSRF values that have been shared outside GitHub Secrets; do not paste credentials into source code, issues, or logs. The request example provided for this project contained session-cookie/XSRF credentials, so invalidate that session and create fresh values before running this workflow.
 
