@@ -910,6 +910,79 @@ class EndpointBudgetTests(unittest.TestCase):
         probe.assert_called_once()
 
 
+@unittest.skipUnless(HAS_REQUESTS, "requests is not installed")
+class BrowserCompatibleRequestTests(unittest.TestCase):
+    """The upload must look like the captured working browser request."""
+
+    def test_multipart_puts_the_file_part_first_without_field_content_types(self):
+        import re
+
+        from fetch_and_upload import _encode_multipart, _upload_form_fields
+
+        body, content_type = _encode_multipart(
+            _upload_form_fields(), "file", "hello world.txt", b"hello world", "text/plain"
+        )
+
+        names = [m.decode() for m in re.findall(rb'(?<!file)name="([^"]+)"', body)]
+        self.assertEqual(
+            names,
+            ["file", "clientMime", "clientExtension", "uploadType", "backendId",
+             "parentId", "workspaceId", "relativePath"],
+        )
+        # urllib3 adds this to every plain field; the browser does not.
+        self.assertNotIn(b"application/octet-stream", body)
+        self.assertIn(b'Content-Type: text/plain', body)
+        self.assertTrue(content_type.startswith("multipart/form-data; boundary="))
+
+    def test_multipart_body_matches_the_captured_browser_length(self):
+        from fetch_and_upload import _encode_multipart, _upload_form_fields
+
+        body, _ = _encode_multipart(
+            _upload_form_fields(), "file", "hello world.txt", b"hello world", "text/plain"
+        )
+        # The captured working request declared Content-Length: 1050 for exactly
+        # these fields and this file.
+        self.assertEqual(len(body), 1050)
+
+    def test_boundary_never_appears_inside_the_payload(self):
+        from fetch_and_upload import _encode_multipart
+
+        payload = b"tricky"
+        body, content_type = _encode_multipart({}, "file", "a.txt", payload, "text/plain")
+        boundary = content_type.split("boundary=", 1)[1].encode()
+        self.assertEqual(body.count(b"--" + boundary), 2)  # opening + closing
+
+    def test_drive_headers_match_the_capture(self):
+        from fetch_and_upload import _upload_base_headers
+
+        headers = _upload_base_headers()
+        self.assertNotIn("X-Requested-With", headers)
+        self.assertEqual(headers["Accept"], "application/json")
+        self.assertEqual(headers["Sec-Fetch-Site"], "same-origin")
+        self.assertEqual(headers["Sec-Fetch-Mode"], "cors")
+        self.assertEqual(headers["Sec-Fetch-Dest"], "empty")
+
+    def test_relative_file_entry_url_becomes_usable(self):
+        from fetch_and_upload import _find_upload_link
+
+        payload = {
+            "fileEntry": {"name": "hello world.txt", "id": 76344,
+                          "url": "api/v1/file-entries/76344"},
+            "status": "success",
+        }
+        link = _find_upload_link(payload)
+        self.assertEqual(link, "https://my.uploadkon.ir/api/v1/file-entries/76344")
+
+    def test_session_warm_up_uses_the_browser_listing_query(self):
+        from fetch_and_upload import _drive_listing_params
+
+        params = _drive_listing_params()
+        self.assertEqual(params["section"], "home")
+        self.assertEqual(params["orderBy"], "created_at")
+        self.assertEqual(params["orderDir"], "desc")
+        self.assertEqual(params["page"], "1")
+
+
 class PublicResponseParsingTests(unittest.TestCase):
     def test_extracts_direct_and_delete_links(self):
         from fetch_and_upload import parse_public_upload_response

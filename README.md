@@ -50,7 +50,18 @@ In **Settings → Secrets and variables → Actions**, add:
 
 ### Diagnosing a host that drops requests
 
-`python fetch_and_upload.py --diagnose-upload` sends progressively closer approximations of the real upload and prints the first one the host does not answer: a plain page `GET`, the same `GET` with the uploader's headers, a form-only `POST`, the multipart upload, and the drive API. That distinguishes "the host refuses this runner" from "the host objects to this request", which a failed upload on its own cannot tell you. It exits non-zero when a probe goes unanswered.
+`python fetch_and_upload.py --diagnose-upload [file]` sends progressively closer approximations of the real upload and prints the first one the host does not answer: a plain page `GET`, the same `GET` with the uploader's headers, a form-only `POST`, then three multipart uploads that form a matrix over **size** and **contents** (small/benign, real size/benign, the real file), then the drive listing `GET` and the drive upload `POST`. From which step fails it reports whether the host drops larger bodies, rejects the file's contents, or refuses the multipart upload at all - a distinction a failed upload cannot make on its own. The benign upload's *request body* is padded with random bytes to match the real one, so the two are comparable after compression. It exits non-zero when a probe goes unanswered.
+
+### Matching the browser request
+
+The drive upload is built to match a captured working browser request byte for byte apart from the boundary:
+
+- the `file` part comes **first**, ahead of `clientMime`/`clientExtension`/`uploadType`/`backendId`/`parentId`/`workspaceId`/`relativePath` (`requests` appends the file part last);
+- plain form fields carry only `Content-Disposition` - no `Content-Type: application/octet-stream`, which urllib3's encoder adds;
+- no `X-Requested-With` header, and the `Sec-Fetch-Dest`/`-Mode`/`-Site` triple is sent;
+- every cookie is sent, including `remember_web_...`, and `X-XSRF-TOKEN` is the URL-decoded `XSRF-TOKEN` from the latest response;
+- the session is warmed with the same listing query the web UI issues (`section=home&folderId=0&workspaceId=0&orderBy=created_at&orderDir=desc&page=1`);
+- the `201` reply carries a relative `fileEntry.url` (`api/v1/file-entries/76344`), which is resolved against the API origin so a usable link is reported.
 
 UploadKon's browser session credentials expire and may need to be refreshed. Rotate/revoke any session cookies or XSRF values that have been shared outside GitHub Secrets; do not paste credentials into source code, issues, or logs. The request example provided for this project contained session-cookie/XSRF credentials, so invalidate that session and create fresh values before running this workflow.
 

@@ -7,7 +7,9 @@ import io
 import json
 import os
 import re
+import secrets
 import sys
+import tempfile
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -554,18 +556,33 @@ def _upload_origin() -> str:
     return "https://my.uploadkon.ir"
 
 
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0"
+)
+
+
 def _upload_base_headers() -> dict[str, str]:
+    """Headers for the my.uploadkon.ir drive API, mirroring the browser.
+
+    A captured working upload sends no ``X-Requested-With`` and does send the
+    ``Sec-Fetch-*`` triple, so match that instead of inventing an AJAX marker.
+    """
     origin = _upload_origin()
     return {
         "Accept": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
+        "Accept-Language": "en-US,en;q=0.9",
         "Origin": origin,
         "Referer": f"{origin}/drive",
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        ),
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "User-Agent": os.getenv("UPLOADKON_USER_AGENT") or DEFAULT_USER_AGENT,
     }
+
+
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0"
+)
 
 
 def _upload_form_fields() -> dict[str, str]:
@@ -577,6 +594,18 @@ def _upload_form_fields() -> dict[str, str]:
         "parentId": os.getenv("UPLOADKON_PARENT_ID") or "",
         "workspaceId": os.getenv("UPLOADKON_WORKSPACE_ID") or "0",
         "relativePath": "",
+    }
+
+
+def _drive_listing_params() -> dict[str, str]:
+    """The drive listing query the web UI issues, used to warm the session."""
+    return {
+        "section": "home",
+        "folderId": os.getenv("UPLOADKON_PARENT_ID") or "0",
+        "workspaceId": os.getenv("UPLOADKON_WORKSPACE_ID") or "0",
+        "orderBy": "created_at",
+        "orderDir": "desc",
+        "page": "1",
     }
 
 
@@ -606,7 +635,7 @@ def _refresh_upload_session(session: requests.Session, cookie: str, raw_xsrf: st
     try:
         response = session.get(
             url,
-            params={"perPage": 1},
+            params=_drive_listing_params(),
             headers={**base_headers, **_connection_headers(),
                      "Cookie": _cookie_header(cookie_dict)},
             timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), min(timeout, 60.0)),
@@ -680,14 +709,24 @@ UPLOAD_LINK_KEYS = (
 
 
 def _find_upload_link(payload: object, depth: int = 0) -> str | None:
-    """Best-effort lookup of the uploaded file's public URL in the API response."""
+    """Best-effort lookup of the uploaded file's URL in the API response.
+
+    The drive API answers ``201`` with ``{"fileEntry": {..., "url":
+    "api/v1/file-entries/76344"}}`` - a relative path, so resolve it against the
+    configured origin instead of discarding it.
+    """
     if depth > 4:
         return None
     if isinstance(payload, dict):
         for key in UPLOAD_LINK_KEYS:
             value = payload.get(key)
-            if isinstance(value, str) and value.startswith(("http://", "https://")):
+            if not isinstance(value, str) or not value.strip():
+                continue
+            value = value.strip()
+            if value.startswith(("http://", "https://")):
                 return value
+            if key == "url":
+                return f"{_upload_origin()}/{value.lstrip('/')}"
         for value in payload.values():
             found = _find_upload_link(value, depth + 1)
             if found:
@@ -808,6 +847,45 @@ def build_archive(path: Path) -> tuple[bytes, str]:
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.write(path, arcname=path.name)
     return buffer.getvalue(), f"{path.name}.zip"
+
+
+def _encode_multipart(fields: dict[str, str], field_name: str, filename: str,
+                      payload: bytes, mime: str) -> tuple[bytes, str]:
+    """Build a multipart body byte-compatible with the captured browser upload.
+
+    Two details differ from what ``requests`` sends:
+
+    * the ``file`` part comes **first**, ahead of ``clientMime``/``uploadType``/...;
+    * plain form fields carry only ``Content-Disposition`` - no
+      ``Content-Type: application/octet-stream``, which is what urllib3's encoder
+      adds for a ``(None, value)`` tuple.
+    """
+    boundary = _multipart_boundary(payload, filename)
+    crlf = b"\r\n"
+    chunks: list[bytes] = []
+
+    def add(disposition: str, content_type: str | None, value: bytes) -> None:
+        chunks.append(b"--" + boundary + crlf)
+        chunks.append(b"Content-Disposition: form-data; " + disposition.encode() + crlf)
+        if content_type:
+            chunks.append(b"Content-Type: " + content_type.encode() + crlf)
+        chunks.append(crlf + value + crlf)
+
+    add(f'name="{field_name}"; filename="{filename}"', mime, payload)
+    for name, value in fields.items():
+        add(f'name="{name}"', None, str(value).encode())
+    chunks.append(b"--" + boundary + b"--" + crlf)
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary.decode()}"
+
+
+def _multipart_boundary(payload: bytes, filename: str) -> bytes:
+    """A boundary that cannot occur in the body, shaped like Firefox's."""
+    while True:
+        candidate = (
+            b"----geckoformboundary" + secrets.token_hex(16).encode()
+        )
+        if candidate not in payload and candidate not in filename.encode():
+            return candidate
 
 
 def _public_archive_enabled() -> bool:
@@ -1006,11 +1084,13 @@ def _public_upload_once(path: Path, timeout: float,
             f"Uploading {upload_name} ({len(payload)} bytes) to the public "
             "uploadkon.ir endpoint ..."
         )
+        body, content_type = _encode_multipart(
+            {"submitr": "1", "ajax": "1"}, "file", upload_name, payload, mime
+        )
         response = session.post(
             url,
-            headers=headers,
-            data={"submitr": "1", "ajax": "1"},
-            files={"file": (upload_name, payload, mime)},
+            headers={**headers, "Content-Type": content_type},
+            data=body,
             timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), timeout),
         )
         # Keep whatever the host sent back for the next attempt.
@@ -1066,15 +1146,16 @@ def _upload_once(path: Path, timeout: float,
             f"UploadKon drive request carries {len(active_cookies)} cookie(s): "
             + ", ".join(sorted(active_cookies))  # names only; never log values
         )
-        # Reopen the file for every attempt so a retry always sends the full body.
-        with path.open("rb") as handle:
-            response = session.post(
-                url,
-                headers=headers,
-                data=_upload_form_fields(),
-                files={"file": (path.name, handle, "text/plain")},
-                timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), timeout),
-            )
+        # Read the file for every attempt so a retry always sends the full body.
+        body, content_type = _encode_multipart(
+            _upload_form_fields(), "file", path.name, path.read_bytes(), "text/plain"
+        )
+        response = session.post(
+            url,
+            headers={**headers, "Content-Type": content_type},
+            data=body,
+            timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), timeout),
+        )
         # The POST rotates the cookies too; keep them for a possible retry.
         _store_response_cookies(session, response, url)
         return _check_upload_response(response)
@@ -1117,19 +1198,26 @@ def _upload_target_once(target: str, path: Path, timeout: float,
 
 
 DIAGNOSE_FILENAME = "mtproto-proxies-probe.txt"
+# Filler for the probe's benign upload; harmless on its own and easy to spot.
+BENIGN_PROBE_LINE = "tg://proxy?server=probe.example&port=443&secret=probe\n"
 
 
-def diagnose_upload(timeout: float = 30.0) -> bool:
+def diagnose_upload(timeout: float = 30.0, path: Path | None = None) -> bool:
     """Work out which request an upload host drops, and say so plainly.
 
-    A failed upload cannot tell us whether the host refuses this runner, or only
-    this kind of request. So send progressively closer approximations of the real
-    upload and report the first one that gets no answer:
+    A failed upload cannot tell us whether the host refuses this runner, objects
+    to the request shape, to the payload size, or to the file's contents. So send
+    progressively closer approximations and report the first one that gets no
+    answer. The upload cases form a 2x2 over size and content:
 
     1. plain GET of the upload page
     2. the same GET with the uploader's full header set
     3. a small form POST (no file)
-    4. the multipart upload itself
+    4. multipart upload, small + benign contents
+    5. multipart upload, real size + benign contents
+    6. multipart upload, small + the real contents
+    7. multipart upload, the real file that failed
+    8. drive listing GET, then the drive upload POST
     """
     public_url = _public_upload_url()
     drive_url = _upload_url()
@@ -1138,15 +1226,17 @@ def diagnose_upload(timeout: float = 30.0) -> bool:
         key: value for key, value in base.items() if key != "X-Requested-With"
     }
     page_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    import tempfile
 
-    with tempfile.TemporaryDirectory() as tmp:
-        probe_path = Path(tmp) / DIAGNOSE_FILENAME
-        probe_path.write_text(
-            "tg://proxy?server=probe.example&port=443&secret=probe\n", encoding="utf-8"
-        )
-        archive, archive_name = build_archive(probe_path)
-    steps = [
+    real_bytes = b""
+    if path is not None:
+        try:
+            real_bytes = path.read_bytes()
+        except OSError:
+            real_bytes = b""
+    benign_small = BENIGN_PROBE_LINE.encode()
+    benign_large = _benign_payload_matching(real_bytes, benign_small)
+
+    steps: list[tuple[str, dict]] = [
         (f"GET  {public_url} (plain page load)",
          {"method": "GET", "url": public_url, "headers": {"Accept": "*/*"}}),
         (f"GET  {public_url} (uploader headers + page cookies)",
@@ -1154,14 +1244,48 @@ def diagnose_upload(timeout: float = 30.0) -> bool:
         (f"POST {public_url} (form only, no file)",
          {"method": "POST", "url": public_url, "headers": base,
           "data": {"submitr": "1", "ajax": "1"}}),
-        (f"POST {public_url} (multipart upload of {archive_name}, {len(archive)} bytes)",
-         {"method": "POST", "url": public_url, "headers": base,
-          "data": {"submitr": "1", "ajax": "1"},
-          "files": {"file": (archive_name, archive, "application/zip")}}),
-        (f"GET  {drive_url} (drive API session probe)",
-         {"method": "GET", "url": drive_url, "params": {"perPage": 1},
-          "headers": _upload_base_headers()}),
     ]
+    # Order matters: benign first, then the real file, so a failure can be
+    # compared against the benign upload of the same size.
+    upload_cases: list[tuple[str, bytes]] = [
+        ("small, benign contents", benign_small),
+        (f"real size {len(benign_large)} bytes, benign contents", benign_large),
+    ]
+    if real_bytes:
+        upload_cases.append((f"the real file ({len(real_bytes)} bytes)", real_bytes))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for label, contents in upload_cases:
+            source = Path(tmp) / DIAGNOSE_FILENAME
+            source.write_bytes(contents)
+            if _public_archive_enabled():
+                archive, archive_name = build_archive(source)
+                mime = "application/zip"
+            else:
+                archive, archive_name, mime = contents, DIAGNOSE_FILENAME, "text/plain"
+            body, content_type = _encode_multipart(
+                {"submitr": "1", "ajax": "1"}, "file", archive_name, archive, mime
+            )
+            steps.append((
+                f"POST {public_url} (multipart upload, {label})",
+                {"method": "POST", "url": public_url,
+                 "headers": {**base, "Content-Type": content_type}, "data": body},
+            ))
+
+    steps.append((
+        f"GET  {drive_url} (drive listing, unauthenticated)",
+        {"method": "GET", "url": drive_url, "params": _drive_listing_params(),
+         "headers": _upload_base_headers()},
+    ))
+    probe_body, probe_type = _encode_multipart(
+        _upload_form_fields(), "file", DIAGNOSE_FILENAME, benign_small, "text/plain"
+    )
+    steps.append((
+        f"POST {drive_url} (drive upload POST, unauthenticated)",
+        {"method": "POST", "url": drive_url,
+         "headers": {**_upload_base_headers(), "Content-Type": probe_type},
+         "data": probe_body},
+    ))
 
     session = requests.Session()
     _configure_session(session)
@@ -1186,16 +1310,80 @@ def diagnose_upload(timeout: float = 30.0) -> bool:
     print("\nUpload host probe (first failure is the interesting one):")
     for label, outcome in results:
         print(f"  [{'ok  ' if outcome.startswith('answered') else 'FAIL'}] {label}\n         -> {outcome}")
-    if all(outcome.startswith("answered") for _, outcome in results):
+    _explain_probe(results)
+    return all(outcome.startswith("answered") for _, outcome in results)
+
+
+def _benign_payload_matching(real_bytes: bytes, benign_small: bytes) -> bytes:
+    """Benign contents whose *request body* matches the real upload's.
+
+    The comparison has to be made on the wire, not on the raw text: the public
+    endpoint uploads a zip, and repetitive text compresses ~20x while random
+    bytes barely compress at all. Padding with random bytes therefore changes the
+    body length one-for-one, which is what makes the two probes comparable.
+    """
+    if not real_bytes:
+        return benign_small * 30
+    real_body = len(_probe_request_body(real_bytes))
+    payload = (BENIGN_PROBE_LINE * (real_body // len(BENIGN_PROBE_LINE) + 2)).encode()
+    for _ in range(20):
+        delta = real_body - len(_probe_request_body(payload))
+        if abs(delta) <= 24:
+            break
+        if delta > 0:
+            payload += secrets.token_bytes(delta)
+        else:
+            payload = payload[: max(len(BENIGN_PROBE_LINE), len(payload) + delta)]
+    return payload
+
+
+def _probe_request_body(contents: bytes) -> bytes:
+    """The exact multipart body the uploader would send for ``contents``."""
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / DIAGNOSE_FILENAME
+        source.write_bytes(contents)
+        if _public_archive_enabled():
+            archive, archive_name = build_archive(source)
+            mime = "application/zip"
+        else:
+            archive, archive_name, mime = contents, DIAGNOSE_FILENAME, "text/plain"
+    body, _ = _encode_multipart(
+        {"submitr": "1", "ajax": "1"}, "file", archive_name, archive, mime
+    )
+    return body
+
+
+def _explain_probe(results: list[tuple[str, str]]) -> None:
+    """Read the size/content matrix back to the operator."""
+    answered = [label for label, outcome in results if outcome.startswith("answered")]
+    failed = [label for label, outcome in results if not outcome.startswith("answered")]
+    if not failed:
         print("\nEvery probe was answered, so the host accepts these requests from "
-              "this runner. A failing upload is therefore about the real request "
-              "or a transient host problem, not a blanket block.")
-        return True
-    print("\nThe host stopped answering at the request above. Compare it with the "
-          "one before it to see what it objects to (headers, POST body, multipart "
-          "upload, or the drive API), and use UPLOADKON_PROXY if it is this "
-          "runner's IP that is refused.")
-    return False
+              "this runner - including a multipart upload of the real size. The "
+              "failing upload is then about the real request or a transient host "
+              "problem, not a blanket block.")
+        return
+    first_fail = failed[0]
+    print(f"\nThe host stopped answering at: {first_fail}")
+    if "small, benign" in first_fail:
+        print("Even a tiny benign upload is dropped, so the host objects to the "
+              "multipart upload itself (or to this runner), not to the file.")
+        return
+    small_ok = any("small, benign" in label for label in answered)
+    large_benign_ok = any("real size" in label for label in answered)
+    real_failed = any("the real file" in label for label in failed)
+    if small_ok and not large_benign_ok:
+        print("A small upload is answered but a real-size one is not: the host "
+              "drops larger request bodies. Try a smaller output file, or "
+              "UPLOADKON_TCP_MSS=0 in case the MSS clamp is fragmenting the body.")
+        return
+    if large_benign_ok and real_failed:
+        print("Benign contents of the same size are accepted, so the host is "
+              "inspecting and rejecting the file's contents.")
+        return
+    print("Compare the failing step with the one before it to see what the host "
+          "objects to, and use UPLOADKON_PROXY if it is this runner that is "
+          "refused.")
 
 
 def verify_public_link(url: str, timeout: float = 60.0) -> bool:
@@ -1393,7 +1581,7 @@ def upload_file(path: Path) -> None:
 
     if _diagnose_on_failure():
         try:
-            diagnose_upload()
+            diagnose_upload(path=path)
         except Exception as exc:  # pragma: no cover - diagnostics must not mask the failure
             print(f"Upload host probe could not run: {type(exc).__name__}: {_one_line(exc)}",
                   file=sys.stderr)
@@ -1410,8 +1598,11 @@ def _diagnose_on_failure() -> bool:
 
 
 def main() -> int:
-    if "--diagnose-upload" in sys.argv[1:]:
-        return 0 if diagnose_upload() else 1
+    args = sys.argv[1:]
+    if "--diagnose-upload" in args:
+        # Optionally probe with a specific file: --diagnose-upload [path]
+        rest = [a for a in args if a != "--diagnose-upload"]
+        return 0 if diagnose_upload(path=Path(rest[0]) if rest else None) else 1
     channel_ids = [
         item.strip()
         for item in re.split(r"[,\s]+", os.getenv("CHANNEL_IDS", ""))
