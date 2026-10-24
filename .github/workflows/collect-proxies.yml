@@ -1,0 +1,71 @@
+name: Collect MTProto proxies
+
+on:
+  push:
+    branches:
+      - main
+      - "arena/**"
+    paths:
+      - ".github/workflows/collect-proxies.yml"
+      - "collect_proxies.py"
+      - "requirements.txt"
+      - "tests/**"
+  schedule:
+    # Once a day at 00:00 Asia/Tehran. Iran is UTC+03:30 year-round (DST was
+    # abolished in 2022), so midnight in Tehran is 20:30 UTC every day.
+    - cron: "30 20 * * *"
+  workflow_dispatch:
+
+permissions:
+  # The job commits the collected proxy list back into results/.
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CHANNEL_IDS: ${{ vars.CHANNEL_IDS || secrets.CHANNEL_IDS }}
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+      # The job runs daily, so look back a full day to leave no gap.
+      LOOKBACK_HOURS: ${{ vars.LOOKBACK_HOURS || '24' }}
+      # Results are committed to this folder in the repository.
+      RESULTS_DIR: ${{ vars.RESULTS_DIR || 'results' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Validate required variables
+        run: |
+          test -n "$CHANNEL_IDS" || { echo 'Missing CHANNEL_IDS repository variable or secret'; exit 1; }
+
+      - name: Collect MTProto proxies
+        run: python collect_proxies.py
+
+      - name: Commit results to this branch
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain -- "$RESULTS_DIR")" ]; then
+            echo "No new results to commit (no proxy links were found in this run)."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$RESULTS_DIR"
+          git commit -m "Add MTProto proxy list for $(date -u '+%Y-%m-%d %H:%M') UTC"
+          # A manual run can overlap the scheduled one; rebase rather than fail.
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"
