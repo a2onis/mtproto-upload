@@ -1202,6 +1202,33 @@ DIAGNOSE_FILENAME = "mtproto-proxies-probe.txt"
 BENIGN_PROBE_LINE = "tg://proxy?server=probe.example&port=443&secret=probe\n"
 
 
+DEFAULT_PROBE_LADDER = (200, 400, 600, 900, 1200, 1600, 2400, 4000, 16000)
+# Upload probes use a shorter read timeout than the real upload: the point is to
+# find where the host stops answering, not to wait out a slow one eight times.
+DEFAULT_PROBE_TIMEOUT = 25.0
+
+
+def _probe_size_ladder() -> list[int]:
+    raw = os.getenv("UPLOADKON_PROBE_SIZES", "").strip()
+    if not raw:
+        return list(DEFAULT_PROBE_LADDER)
+    try:
+        sizes = sorted({max(64, int(part)) for part in re.split(r"[,\s]+", raw) if part})
+    except ValueError as exc:
+        raise ValueError(f"UPLOADKON_PROBE_SIZES must be integers, got {raw!r}") from exc
+    return sizes or list(DEFAULT_PROBE_LADDER)
+
+
+def _probe_timeout(timeout: float) -> float:
+    raw = os.getenv("UPLOADKON_PROBE_TIMEOUT", "").strip()
+    if not raw:
+        return min(DEFAULT_PROBE_TIMEOUT, timeout)
+    try:
+        return max(5.0, float(raw))
+    except ValueError as exc:
+        raise ValueError(f"UPLOADKON_PROBE_TIMEOUT must be a number, got {raw!r}") from exc
+
+
 def _probe_verdict_for_upload(text: str) -> str:
     """Read an uploadkon.ir reply the way the uploader does."""
     try:
@@ -1306,11 +1333,11 @@ def diagnose_upload(timeout: float = 30.0, path: Path | None = None) -> bool:
         except OSError:
             real_bytes = b""
     real_body = len(_probe_request_body(real_bytes)) if real_bytes else 0
-    # Ladder of upload sizes to walk. Repetitive proxy text zips very well (4.5 KB
-    # of configs -> ~1 KB), so a ladder based on the real *request body* would
-    # never reach the sizes where a host starts refusing. Walk both: the real
-    # body size, and a range of raw payload sizes that compress negligibly.
-    raw_ladder = [200, 1000, 4000, 16000]
+    # Ladder of upload sizes to walk, in raw bytes of incompressible random data.
+    # The interesting band is 400-2000 raw bytes (roughly 1.2-2.5 KB on the wire),
+    # which is where a host that only answers single-segment requests starts going
+    # quiet, so step finely there and coarsely outside it.
+    raw_ladder = _probe_size_ladder()
     if real_body:
         raw_ladder = sorted({*raw_ladder, max(200, real_body)})
 
@@ -1361,7 +1388,7 @@ def diagnose_upload(timeout: float = 30.0, path: Path | None = None) -> bool:
     ))
 
     print(f"Runner egress IP: {_egress_ip()}")
-    results = _run_probe_steps(steps, timeout)
+    results = _run_probe_steps(steps, _probe_timeout(timeout))
 
     print("\nUpload host probe:")
     for entry in results:
@@ -1394,6 +1421,30 @@ def _zip_bytes(contents: bytes) -> bytes:
         return build_archive(source)[0]
 
 
+def _wire_size(label: str) -> int | None:
+    """The '... bytes on the wire' figure an upload probe reports."""
+    match = re.search(r"(\d+) bytes on the wire", label)
+    return int(match.group(1)) if match else None
+
+
+def _quiet_threshold(uploads: list[dict]) -> int | None:
+    """Largest upload the host answered, when larger ones all went quiet."""
+    answered = [
+        size for entry in uploads
+        if entry["ok"] and (size := _wire_size(entry["label"])) is not None
+    ]
+    silent = [
+        size for entry in uploads
+        if entry["verdict"].startswith("NO RESPONSE")
+        and (size := _wire_size(entry["label"])) is not None
+    ]
+    if not answered or not silent:
+        return None
+    largest_answered = max(answered)
+    # Only a real threshold if everything above it went quiet.
+    return largest_answered if all(size > largest_answered for size in silent) else None
+
+
 def _explain_probe(results: list[dict]) -> None:
     """Report the observed pattern without inventing a cause."""
     uploads = [e for e in results if "upload:" in e["label"]]
@@ -1421,9 +1472,18 @@ def _explain_probe(results: list[dict]) -> None:
               "blanket block of this runner. Compare the sizes and contents of the "
               "ACCEPTED and DROPPED rows above to see which one it objects to.")
     if silent:
-        print("\nNO RESPONSE means the host accepted the request and then went "
-              "quiet - a server-side stall rather than a refusal. Retry later, or "
-              "raise UPLOADKON_TIMEOUT if the host is merely slow.")
+        limit = _quiet_threshold(uploads)
+        print("\nNO RESPONSE means the host read the request and then went quiet - "
+              "it took the bytes and never replied, so waiting longer will not "
+              "help; this is not a timeout to raise.")
+        if limit:
+            print(f"The largest upload it did answer was {limit} bytes on the wire, "
+                  "and every larger one went quiet, so the limit sits just above "
+                  "that. Re-run with UPLOADKON_TCP_MSS=0 to test whether the "
+                  "1000-byte MSS clamp is splitting the request into segments the "
+                  "route drops; if that changes nothing, the host itself refuses "
+                  "larger uploads and the file has to be smaller or go to the "
+                  "drive endpoint.")
     if dropped and not accepted:
         print("\nEvery upload was dropped, including the smallest, so the host is "
               "refusing the multipart upload itself (or this runner). Set "
