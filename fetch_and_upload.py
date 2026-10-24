@@ -307,6 +307,93 @@ def _strip_header_prefix(value: str, prefix: str) -> str:
     return value
 
 
+def _set_cookie_headers(response: object) -> list[str]:
+    """Every ``Set-Cookie`` header of ``response``, in arrival order.
+
+    ``response.cookies`` collapses repeated cookie names into a single value and
+    only keeps cookies the cookie policy accepted, so read the raw headers to
+    capture exactly what the server sent.
+    """
+    headers = getattr(response, "raw", None)
+    headers = getattr(headers, "headers", None)
+    getlist = getattr(headers, "getlist", None)
+    if callable(getlist):
+        try:
+            return [str(value) for value in getlist("Set-Cookie")]
+        except Exception:  # pragma: no cover - exotic urllib3 backends
+            pass
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return []
+    getlist = getattr(headers, "getlist", None)
+    if callable(getlist):
+        try:
+            return [str(value) for value in getlist("Set-Cookie")]
+        except Exception:  # pragma: no cover - header objects without getlist
+            return []
+    if isinstance(headers, dict):
+        value = headers.get("Set-Cookie") or headers.get("set-cookie")
+        return [str(value)] if value else []
+    return []
+
+
+def _store_response_cookies(session: requests_types.Session, response: object,
+                            url: str) -> dict[str, str]:
+    """Keep the cookies of ``response`` so the next request can send them back.
+
+    UploadKon (a Laravel app) rotates both ``XSRF-TOKEN`` and
+    ``aplod_kn_session`` on *every* response, including the ones that fail, and
+    only accepts the newest pair. Anything we do not store here is silently
+    dropped, which is what turns the following POST into a ``419``.
+    """
+    stored: dict[str, str] = {}
+    origin = urlsplit(url or "")
+    host = origin.hostname or None
+    for header in _set_cookie_headers(response):
+        pairs = re.split(r";\s*", header, maxsplit=1)
+        name, sep, value = (pairs[0] if pairs else "").partition("=")
+        name = name.strip()
+        if not sep or not name:
+            continue
+        # The jar (not a Cookie header) is the single source of truth: requests
+        # adds these cookies to every later request automatically.
+        session.cookies.set(name, value.strip(), domain=host)
+        stored[name] = value.strip()
+    if not stored:
+        jar = getattr(response, "cookies", None)
+        if jar is not None:
+            try:
+                for name, value in dict(jar).items():
+                    session.cookies.set(name, value, domain=host)
+                    stored[name] = value
+            except Exception:  # pragma: no cover - defensive
+                pass
+    if stored:
+        print(
+            "Stored cookie(s) from the server response for the next request: "
+            + ", ".join(sorted(stored))  # names only; never log cookie values
+        )
+    return stored
+
+
+def _jar_cookies(session: requests_types.Session) -> dict[str, str]:
+    """Cookies the session already collected from previous responses."""
+    jar = getattr(session, "cookies", None)
+    if jar is None:
+        return {}
+    try:
+        return {name: value or "" for name, value in dict(jar).items()}
+    except Exception:  # pragma: no cover - defensive
+        return {}
+
+
+def _cookie_header(cookies: dict[str, str]) -> str:
+    """Render a ``Cookie`` request header from the accumulated cookie set."""
+    return "; ".join(
+        f"{name}={value}" for name, value in cookies.items() if value != ""
+    )
+
+
 def _one_line(value: object, limit: int = 300) -> str:
     text = str(value).replace("\r", " ").replace("\n", " ")
     text = re.sub(r"\s+", " ", text).strip()
@@ -410,14 +497,24 @@ def _load_upload_credentials() -> tuple[str, str]:
 
 
 def _refresh_upload_session(session: requests.Session, cookie: str, raw_xsrf: str,
-                            base_headers: dict[str, str], timeout: float) -> tuple[str, str]:
-    """Bootstrap/refresh the active cookie and XSRF token before uploading."""
+                            base_headers: dict[str, str],
+                            timeout: float) -> tuple[dict[str, str], str]:
+    """Bootstrap/refresh the active cookies and XSRF token before uploading.
+
+    Returns the cookie set to send next (configured cookies overwritten by
+    whatever the server just sent back) plus the matching ``X-XSRF-TOKEN`` value.
+    """
+    # Cookies collected from earlier responses win over the configured secret:
+    # the server has rotated them since, and only accepts the newest values.
     cookie_dict = _parse_cookie_header(cookie)
+    cookie_dict.update(_jar_cookies(session))
+    url = f"{_upload_origin()}/api/v1/drive/file-entries"
     try:
         response = session.get(
-            f"{_upload_origin()}/api/v1/drive/file-entries",
+            url,
             params={"perPage": 1},
-            headers={**base_headers, "Cookie": cookie, "Connection": "close"},
+            headers={**base_headers, "Cookie": _cookie_header(cookie_dict),
+                     "Connection": "close"},
             timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), min(timeout, 60.0)),
         )
     except requests.exceptions.RequestException as exc:
@@ -429,29 +526,27 @@ def _refresh_upload_session(session: requests.Session, cookie: str, raw_xsrf: st
             file=sys.stderr,
         )
         active_xsrf = unquote(cookie_dict.get("XSRF-TOKEN", "") or "") or unquote(raw_xsrf)
-        return cookie, active_xsrf
+        return cookie_dict, active_xsrf
+
+    # Whatever the server sent back must survive until the next request, even
+    # when the response itself is an error: Laravel rotates XSRF-TOKEN and
+    # aplod_kn_session on every reply and rejects the previous pair.
+    cookie_dict.update(_store_response_cookies(session, response, url))
 
     if response.status_code in AUTH_HTTP_STATUS:
         raise RetryableUploadError(
             f"UploadKon rejected UPLOADKON_COOKIE (HTTP {response.status_code}); "
             "refresh the UPLOADKON_COOKIE and UPLOADKON_XSRF_TOKEN secrets"
         )
-    if response.ok:
-        cookie_dict.update(response.cookies.get_dict())
-    else:
+    if not response.ok:
         print(
             f"Warning: UploadKon session refresh returned HTTP {response.status_code}; "
-            "continuing with the configured cookie.",
+            "continuing with the cookies received so far.",
             file=sys.stderr,
         )
 
     active_xsrf = unquote(cookie_dict.get("XSRF-TOKEN", "") or "") or unquote(raw_xsrf)
-    # Laravel only needs aplod_kn_session in Cookie; keep the header compact.
-    if "aplod_kn_session" in cookie_dict:
-        cookie_str = f"aplod_kn_session={cookie_dict['aplod_kn_session']}"
-    else:
-        cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
-    return cookie_str, active_xsrf
+    return cookie_dict, active_xsrf
 
 
 def _check_upload_response(response: requests.Response) -> dict | list:
@@ -710,12 +805,18 @@ def _warm_up_public_session(session: requests.Session, timeout: float) -> None:
     )
 
 
-def _public_upload_once(path: Path, timeout: float) -> dict[str, str]:
-    """Upload ``path`` to the public uploadkon.ir endpoint (no login required)."""
+def _public_upload_once(path: Path, timeout: float,
+                        http: requests.Session | None = None) -> dict[str, str]:
+    """Upload ``path`` to the public uploadkon.ir endpoint (no login required).
+
+    ``http`` is reused across attempts so the cookies set by an earlier response
+    are still available to the next request.
+    """
     url = _public_upload_url()
-    session = requests.Session()
+    session = http or requests.Session()
     try:
-        _configure_session(session)
+        if http is None:
+            _configure_session(session)
         _warm_up_public_session(session, timeout)
         headers = _public_upload_headers()
         if _public_archive_enabled():
@@ -737,6 +838,8 @@ def _public_upload_once(path: Path, timeout: float) -> dict[str, str]:
             files={"file": (upload_name, payload, mime)},
             timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), timeout),
         )
+        # Keep whatever the host sent back for the next attempt.
+        _store_response_cookies(session, response, url)
         status = response.status_code
         snippet = _one_line(response.text[:300])
         if status in RETRYABLE_HTTP_STATUS:
@@ -755,27 +858,41 @@ def _public_upload_once(path: Path, timeout: float) -> dict[str, str]:
             "UPLOADKON_PROXY repository secret/variable to route through a proxy."
         ) from exc
     finally:
-        session.close()
+        if http is None:
+            session.close()
 
 
-def _upload_once(path: Path, timeout: float) -> dict | list:
-    """One authenticated UploadKon drive upload attempt (session + POST)."""
+def _upload_once(path: Path, timeout: float,
+                 http: requests.Session | None = None) -> dict | list:
+    """One authenticated UploadKon drive upload attempt (session + POST).
+
+    ``http`` is reused across attempts so the cookies rotated by a previous
+    response are still in the jar for the next request.
+    """
     cookie, raw_xsrf = _load_upload_credentials()
     base_headers = _upload_base_headers()
     url = _upload_url()
 
-    session = requests.Session()
+    session = http or requests.Session()
     try:
-        _configure_session(session)
-        active_cookie, active_xsrf = _refresh_upload_session(
+        if http is None:
+            _configure_session(session)
+        active_cookies, active_xsrf = _refresh_upload_session(
             session, cookie, raw_xsrf, base_headers, timeout
         )
         headers = {
             **base_headers,
-            "Cookie": active_cookie,
-            "X-XSRF-TOKEN": active_xsrf,
+            # Send every cookie we hold: the session cookie the API authenticates
+            # with plus the XSRF-TOKEN the server rotated in its last response.
+            "Cookie": _cookie_header(active_cookies),
             "Connection": "close",
         }
+        if active_xsrf:
+            headers["X-XSRF-TOKEN"] = active_xsrf
+        print(
+            f"UploadKon drive request carries {len(active_cookies)} cookie(s): "
+            + ", ".join(sorted(active_cookies))  # names only; never log values
+        )
         # Reopen the file for every attempt so a retry always sends the full body.
         with path.open("rb") as handle:
             response = session.post(
@@ -785,9 +902,12 @@ def _upload_once(path: Path, timeout: float) -> dict | list:
                 files={"file": (path.name, handle, "text/plain")},
                 timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), timeout),
             )
+        # The POST rotates the cookies too; keep them for a possible retry.
+        _store_response_cookies(session, response, url)
         return _check_upload_response(response)
     finally:
-        session.close()
+        if http is None:
+            session.close()
 
 
 UPLOAD_TARGETS = ("public", "drive")
@@ -816,8 +936,11 @@ def _upload_targets(mode: str, cookie_available: bool) -> list[str]:
     )
 
 
-def _upload_target_once(target: str, path: Path, timeout: float) -> object:
-    return _public_upload_once(path, timeout) if target == "public" else _upload_once(path, timeout)
+def _upload_target_once(target: str, path: Path, timeout: float,
+                        http: requests.Session | None = None) -> object:
+    if target == "public":
+        return _public_upload_once(path, timeout, http)
+    return _upload_once(path, timeout, http)
 
 
 def verify_public_link(url: str, timeout: float = 60.0) -> bool:
@@ -877,6 +1000,19 @@ def _report_upload_success(target: str, result: object) -> None:
 def _try_upload_target(target: str, path: Path, attempts: int, timeout: float,
                        deadline: float) -> None:
     """Upload via one target with retries; raises when every attempt fails."""
+    # One session for every attempt of this endpoint: the server rotates its
+    # cookies on each response, and the next request has to send them back.
+    http = requests.Session()
+    _configure_session(http)
+    try:
+        return _upload_attempts(target, path, attempts, timeout, deadline, http)
+    finally:
+        http.close()
+
+
+def _upload_attempts(target: str, path: Path, attempts: int, timeout: float,
+                     deadline: float, http: requests.Session) -> None:
+    """Retry loop for one endpoint, sharing ``http`` (and its cookies) throughout."""
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         remaining = deadline - time.monotonic()
@@ -889,7 +1025,7 @@ def _try_upload_target(target: str, path: Path, attempts: int, timeout: float,
             )
             break
         try:
-            result = _upload_target_once(target, path, min(timeout, remaining))
+            result = _upload_target_once(target, path, min(timeout, remaining), http)
         except PermanentUploadError as exc:
             message = (
                 f"Upload via {target} failed permanently: "

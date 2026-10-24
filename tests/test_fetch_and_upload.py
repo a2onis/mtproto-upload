@@ -99,10 +99,22 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class _HeaderBag:
+    """Mimics urllib3's HTTPHeaderDict, which can repeat a header name."""
+
+    def __init__(self, pairs):
+        self._pairs = list(pairs)
+
+    def getlist(self, name):
+        lowered = name.lower()
+        return [value for key, value in self._pairs if key.lower() == lowered]
+
+
 class _FakeResponse:
     """Minimal requests.Response stand-in for upload tests."""
 
-    def __init__(self, status_code: int = 200, payload=None, text: str = ""):
+    def __init__(self, status_code: int = 200, payload=None, text: str = "",
+                 set_cookies=()):
         import requests
 
         self.status_code = status_code
@@ -111,6 +123,12 @@ class _FakeResponse:
         self.text = text or ("{}" if payload is not None else "")
         self.cookies = requests.cookies.RequestsCookieJar()
         self.headers: dict[str, str] = {}
+        self.raw = None
+        if set_cookies:
+            self.raw = type("Raw", (), {})()
+            self.raw.headers = _HeaderBag(
+                [("Set-Cookie", value) for value in set_cookies]
+            )
 
     def __enter__(self):
         return self
@@ -312,6 +330,155 @@ class SessionRefreshTests(unittest.TestCase):
             headers = session.post.call_args.kwargs["headers"]
             self.assertEqual(headers["Cookie"], "aplod_kn_session=abc")
             self.assertEqual(headers["X-XSRF-TOKEN"], "def")
+
+
+ROTATED_XSRF_COOKIE = (
+    "XSRF-TOKEN=eyJpdiI6InFnaXo3SWg0ajk4dHJVZ0NGMmN4Q3c9PSJ9%3D; "
+    "expires=Sat, 24 Oct 2026 20:14:53 GMT; Max-Age=7200; path=/; secure; samesite=lax"
+)
+ROTATED_SESSION_COOKIE = (
+    "aplod_kn_session=eyJpdiI6IjNQa3A4MjJxRzNlWnJxOVEvNDVCanc9PSJ9%3D; "
+    "expires=Sat, 24 Oct 2026 20:14:53 GMT; Max-Age=7200; path=/; secure; httponly; "
+    "samesite=lax"
+)
+
+
+@unittest.skipUnless(HAS_REQUESTS, "requests is not installed")
+class ResponseCookieCarryoverTests(unittest.TestCase):
+    """Cookies from the latest response headers must be sent on the next request."""
+
+    def test_stores_every_set_cookie_header_including_repeated_names(self):
+        from unittest import mock
+
+        import requests
+
+        from fetch_and_upload import _store_response_cookies
+
+        session = requests.Session()
+        response = _FakeResponse(
+            200,
+            set_cookies=[ROTATED_XSRF_COOKIE, ROTATED_SESSION_COOKIE, "locale=en"],
+        )
+        stored = _store_response_cookies(
+            session, response, "https://my.uploadkon.ir/api/v1/drive/file-entries"
+        )
+
+        self.assertEqual(
+            sorted(stored), ["XSRF-TOKEN", "aplod_kn_session", "locale"]
+        )
+        # The value must be the raw cookie value, without the attributes.
+        self.assertTrue(stored["aplod_kn_session"].startswith("eyJpdiI6IjNQa3A4"))
+        self.assertNotIn("Max-Age", stored["aplod_kn_session"])
+        self.assertEqual(session.cookies.get("XSRF-TOKEN", domain="my.uploadkon.ir"),
+                         "eyJpdiI6InFnaXo3SWg0ajk4dHJVZ0NGMmN4Q3c9PSJ9%3D")
+
+    def test_cookies_from_an_error_response_are_kept_too(self):
+        from unittest import mock
+
+        import requests
+
+        from fetch_and_upload import _store_response_cookies
+
+        session = requests.Session()
+        response = _FakeResponse(419, text="page expired", set_cookies=[ROTATED_XSRF_COOKIE])
+        stored = _store_response_cookies(session, response, "https://my.uploadkon.ir/x")
+
+        self.assertIn("XSRF-TOKEN", stored)
+        self.assertEqual(session.cookies.get("XSRF-TOKEN", domain="my.uploadkon.ir"),
+                         "eyJpdiI6InFnaXo3SWg0ajk4dHJVZ0NGMmN4Q3c9PSJ9%3D")
+
+    def test_drive_upload_sends_the_rotated_cookie_and_token(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from fetch_and_upload import upload_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mtproto-proxies-test.txt"
+            path.write_text("tg://proxy?server=a&port=443&secret=b\n", encoding="utf-8")
+
+            refresh = _FakeResponse(
+                200, {"data": []}, set_cookies=[ROTATED_XSRF_COOKIE, ROTATED_SESSION_COOKIE]
+            )
+            session = mock.MagicMock()
+            session.get.return_value = refresh
+            session.post.return_value = _FakeResponse(
+                200, {"data": {"url": "https://my.uploadkon.ir/d/abc"}}
+            )
+
+            env = {
+                "UPLOADKON_MODE": "drive",
+                "UPLOADKON_COOKIE": "aplod_kn_session=stale-session; XSRF-TOKEN=stale-token",
+                "UPLOADKON_XSRF_TOKEN": "stale-token",
+            }
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch("fetch_and_upload.requests.Session", return_value=session):
+                upload_file(path)
+
+            headers = session.post.call_args.kwargs["headers"]
+            sent = dict(
+                part.split("=", 1) for part in headers["Cookie"].split("; ")
+            )
+            # The newest values from the response replace the configured ones.
+            self.assertEqual(
+                sent["aplod_kn_session"], "eyJpdiI6IjNQa3A4MjJxRzNlWnJxOVEvNDVCanc9PSJ9%3D"
+            )
+            self.assertEqual(
+                sent["XSRF-TOKEN"], "eyJpdiI6InFnaXo3SWg0ajk4dHJVZ0NGMmN4Q3c9PSJ9%3D"
+            )
+            # Laravel compares the URL-decoded header against the XSRF-TOKEN cookie.
+            self.assertEqual(
+                headers["X-XSRF-TOKEN"], 'eyJpdiI6InFnaXo3SWg0ajk4dHJVZ0NGMmN4Q3c9PSJ9='
+            )
+            self.assertNotIn("stale", headers["Cookie"])
+
+    def test_rotated_cookie_from_a_rejected_upload_is_sent_by_the_next_request(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        import requests
+
+        from fetch_and_upload import upload_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mtproto-proxies-test.txt"
+            path.write_text("tg://proxy?server=a&port=443&secret=b\n", encoding="utf-8")
+
+            # A real jar on the mock so stored cookies can be inspected.
+            jar = requests.cookies.RequestsCookieJar()
+            session = mock.MagicMock()
+            session.cookies = jar
+            session.get.return_value = _FakeResponse(200, {"data": []})
+            session.post.side_effect = [
+                _FakeResponse(419, text="page expired", set_cookies=[ROTATED_XSRF_COOKIE]),
+                _FakeResponse(200, {"data": {"url": "https://my.uploadkon.ir/d/abc"}}),
+            ]
+            env = {
+                "UPLOADKON_MODE": "drive",
+                "UPLOADKON_COOKIE": "aplod_kn_session=s1; XSRF-TOKEN=old",
+                "UPLOADKON_XSRF_TOKEN": "old",
+            }
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch("fetch_and_upload.requests.Session", return_value=session), \
+                    mock.patch("fetch_and_upload.time.sleep"):
+                upload_file(path)
+
+            self.assertEqual(session.post.call_count, 2)
+            # The 419 reply rotated the token; the retry must send the new value,
+            # not the stale one from the secret.
+            retry_cookie = session.get.call_args_list[1].kwargs["headers"]["Cookie"]
+            self.assertIn(
+                "XSRF-TOKEN=eyJpdiI6InFnaXo3SWg0ajk4dHJVZ0NGMmN4Q3c9PSJ9%3D", retry_cookie
+            )
+            self.assertNotIn("XSRF-TOKEN=old", retry_cookie)
+            self.assertEqual(
+                session.post.call_args_list[1].kwargs["headers"]["X-XSRF-TOKEN"],
+                "eyJpdiI6InFnaXo3SWg0ajk4dHJVZ0NGMmN4Q3c9PSJ9=",
+            )
 
 
 class PublicResponseParsingTests(unittest.TestCase):

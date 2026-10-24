@@ -59,6 +59,8 @@ Per endpoint, the uploader:
 
 - loads `https://uploadkon.ir/` first so any session/anti-bot cookie is present, then reuses it for the public upload;
 - refreshes the UploadKon session/`XSRF-TOKEN` before each drive attempt;
+- **carries the cookies from every response over to the next request**: UploadKon rotates both `XSRF-TOKEN` and `aplod_kn_session` in the `set-cookie` headers of each reply (including error replies), so the uploader stores all of them in the session cookie jar and sends the newest values back, plus the URL-decoded `XSRF-TOKEN` in the `X-XSRF-TOKEN` header. `UPLOADKON_COOKIE`/`UPLOADKON_XSRF_TOKEN` are only the seed for the first request;
+- reuses one HTTP session (and therefore one cookie jar) for all attempts at an endpoint, so a retry after a `419` sends the token the server just issued instead of the stale one;
 - uses a separate connect timeout (30 s) and a configurable read timeout (`UPLOADKON_TIMEOUT`, default 120 s);
 - retries timeouts, connection resets, HTTP `408`/`425`/`429`/`5xx`, non-JSON replies, and expired session/CSRF responses (`401`/`403`/`419`) up to `UPLOADKON_MAX_ATTEMPTS` times (default 4) with exponential backoff (5 s, 10 s, 20 s, capped at 30 s);
 - stays inside an overall `UPLOADKON_TOTAL_TIMEOUT` budget (default 600 s) so retries never outlast the job;
