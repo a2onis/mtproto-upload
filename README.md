@@ -50,7 +50,9 @@ In **Settings → Secrets and variables → Actions**, add:
 
 ### Diagnosing a host that drops requests
 
-`python fetch_and_upload.py --diagnose-upload [file]` sends progressively closer approximations of the real upload and prints the first one the host does not answer: a plain page `GET`, the same `GET` with the uploader's headers, a form-only `POST`, then three multipart uploads that form a matrix over **size** and **contents** (small/benign, real size/benign, the real file), then the drive listing `GET` and the drive upload `POST`. From which step fails it reports whether the host drops larger bodies, rejects the file's contents, or refuses the multipart upload at all - a distinction a failed upload cannot make on its own. The benign upload's *request body* is padded with random bytes to match the real one, so the two are comparable after compression. It exits non-zero when a probe goes unanswered.
+`python fetch_and_upload.py --diagnose-upload [file]` sends progressively closer approximations of the real upload and classifies each one as `ACCEPTED` (a link came back), `REJECTED` (the host answered with a reason), `DROPPED` (it closed the connection before answering) or `NO RESPONSE` (it read the request and then went quiet). Those last two look alike in a summary line but mean different things: a drop is a refusal, a stall is a server that took the request and never replied.
+
+The upload steps walk a size ladder - 200, 1000, 4000 and 16000 raw bytes, plus the real file's body size - using random bytes, which do not compress, so the sizes on the wire are the sizes chosen. This matters because repetitive proxy text zips extremely well: 4.5 KB of configs becomes a ~1 KB request body, so a ladder based on the real body would never reach the sizes where a host starts refusing. Each step also prints its size on the wire, and the real file is probed last regardless of earlier failures so the matrix stays complete. It exits non-zero when any probe goes unanswered.
 
 ### Matching the browser request
 

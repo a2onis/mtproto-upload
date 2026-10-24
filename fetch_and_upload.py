@@ -1202,22 +1202,94 @@ DIAGNOSE_FILENAME = "mtproto-proxies-probe.txt"
 BENIGN_PROBE_LINE = "tg://proxy?server=probe.example&port=443&secret=probe\n"
 
 
+def _probe_verdict_for_upload(text: str) -> str:
+    """Read an uploadkon.ir reply the way the uploader does."""
+    try:
+        result = parse_public_upload_response(text)
+    except PermanentUploadError as exc:
+        return f"REJECTED by the host: {_one_line(exc, 160)}"
+    except UploadError as exc:
+        return f"answered, but unusable: {_one_line(exc, 160)}"
+    return f"ACCEPTED, link: {result.get('direct_url', '')}"
+
+
+def _classify_probe_failure(exc: Exception) -> str:
+    """Distinguish the two failures that look alike in a summary line.
+
+    ``RemoteDisconnected`` means the host closed the socket before answering;
+    a read timeout means it accepted the request and never replied. They point
+    at different causes, so they must not share one label.
+    """
+    text = _one_line(exc, 400)
+    if "RemoteDisconnected" in text or "Connection aborted" in text:
+        return "DROPPED (host closed the connection before answering)"
+    if "timed out" in text or "Timeout" in text or "timeout" in text:
+        return "NO RESPONSE (host read the request, then never replied)"
+    return f"FAILED ({type(exc).__name__}: {_one_line(exc, 160)})"
+
+
+def _run_probe_steps(steps: list[tuple[str, dict]], timeout: float) -> list[dict]:
+    session = requests.Session()
+    _configure_session(session)
+    results: list[dict] = []
+    saw_failure = False
+    try:
+        for label, kwargs in steps:
+            # Read without popping: steps_left_are_uploads() inspects the same
+            # dicts, and requests ignores unknown keys here because we pass the
+            # rest through **kwargs below.
+            is_upload = bool(kwargs.get("_upload"))
+            entry: dict = {"label": label, "ok": False, "verdict": "", "upload": is_upload}
+            request_kwargs = {k: v for k, v in kwargs.items() if k != "_upload"}
+            try:
+                response = session.request(
+                    timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), timeout),
+                    **request_kwargs
+                )
+            except requests.exceptions.RequestException as exc:
+                entry["verdict"] = _classify_probe_failure(exc)
+                results.append(entry)
+                saw_failure = True
+                # Keep walking the upload matrix so its verdict is complete, but
+                # stop once the host refuses plain requests too - it is not
+                # talking to us at all and every further step would just time out.
+                if not is_upload or not next_step_is_upload(steps, label):
+                    break
+                continue
+            entry["ok"] = True
+            body = _one_line(response.text[:160])
+            if is_upload:
+                entry["verdict"] = _probe_verdict_for_upload(response.text)
+            else:
+                entry["verdict"] = (
+                    f"answered HTTP {response.status_code} "
+                    f"({len(response.content)} bytes)" + (f": {body}" if body else "")
+                )
+            results.append(entry)
+            if saw_failure and not is_upload:
+                break
+    finally:
+        session.close()
+    return results
+
+
+def next_step_is_upload(steps: list[tuple[str, dict]], current_label: str) -> bool:
+    """True when the probe right after ``current_label`` is another upload."""
+    for index, (label, _kwargs) in enumerate(steps):
+        if label == current_label:
+            return index + 1 < len(steps) and bool(steps[index + 1][1].get("_upload"))
+    return False
+
+
 def diagnose_upload(timeout: float = 30.0, path: Path | None = None) -> bool:
-    """Work out which request an upload host drops, and say so plainly.
+    """Work out which upload request a host refuses, and say what it did.
 
     A failed upload cannot tell us whether the host refuses this runner, objects
     to the request shape, to the payload size, or to the file's contents. So send
-    progressively closer approximations and report the first one that gets no
-    answer. The upload cases form a 2x2 over size and content:
-
-    1. plain GET of the upload page
-    2. the same GET with the uploader's full header set
-    3. a small form POST (no file)
-    4. multipart upload, small + benign contents
-    5. multipart upload, real size + benign contents
-    6. multipart upload, small + the real contents
-    7. multipart upload, the real file that failed
-    8. drive listing GET, then the drive upload POST
+    progressively closer approximations, and for each one record one of:
+    ``ACCEPTED`` / ``REJECTED`` / ``DROPPED`` / ``NO RESPONSE``. The size ladder
+    uses random bytes because they do not compress, so the sizes on the wire are
+    the sizes we choose - repetitive text would zip ~20x smaller.
     """
     public_url = _public_upload_url()
     drive_url = _upload_url()
@@ -1233,8 +1305,14 @@ def diagnose_upload(timeout: float = 30.0, path: Path | None = None) -> bool:
             real_bytes = path.read_bytes()
         except OSError:
             real_bytes = b""
-    benign_small = BENIGN_PROBE_LINE.encode()
-    benign_large = _benign_payload_matching(real_bytes, benign_small)
+    real_body = len(_probe_request_body(real_bytes)) if real_bytes else 0
+    # Ladder of upload sizes to walk. Repetitive proxy text zips very well (4.5 KB
+    # of configs -> ~1 KB), so a ladder based on the real *request body* would
+    # never reach the sizes where a host starts refusing. Walk both: the real
+    # body size, and a range of raw payload sizes that compress negligibly.
+    raw_ladder = [200, 1000, 4000, 16000]
+    if real_body:
+        raw_ladder = sorted({*raw_ladder, max(200, real_body)})
 
     steps: list[tuple[str, dict]] = [
         (f"GET  {public_url} (plain page load)",
@@ -1245,32 +1323,26 @@ def diagnose_upload(timeout: float = 30.0, path: Path | None = None) -> bool:
          {"method": "POST", "url": public_url, "headers": base,
           "data": {"submitr": "1", "ajax": "1"}}),
     ]
-    # Order matters: benign first, then the real file, so a failure can be
-    # compared against the benign upload of the same size.
-    upload_cases: list[tuple[str, bytes]] = [
-        ("small, benign contents", benign_small),
-        (f"real size {len(benign_large)} bytes, benign contents", benign_large),
+    cases: list[tuple[str, bytes]] = [
+        (f"random contents, {size} bytes raw", secrets.token_bytes(size))
+        for size in raw_ladder
     ]
     if real_bytes:
-        upload_cases.append((f"the real file ({len(real_bytes)} bytes)", real_bytes))
+        cases.append((f"THE REAL FILE ({len(real_bytes)} bytes raw)", real_bytes))
 
-    with tempfile.TemporaryDirectory() as tmp:
-        for label, contents in upload_cases:
-            source = Path(tmp) / DIAGNOSE_FILENAME
-            source.write_bytes(contents)
-            if _public_archive_enabled():
-                archive, archive_name = build_archive(source)
-                mime = "application/zip"
-            else:
-                archive, archive_name, mime = contents, DIAGNOSE_FILENAME, "text/plain"
-            body, content_type = _encode_multipart(
-                {"submitr": "1", "ajax": "1"}, "file", archive_name, archive, mime
-            )
-            steps.append((
-                f"POST {public_url} (multipart upload, {label})",
-                {"method": "POST", "url": public_url,
-                 "headers": {**base, "Content-Type": content_type}, "data": body},
-            ))
+    for label, contents in cases:
+        body, content_type = _encode_multipart(
+            {"submitr": "1", "ajax": "1"}, "file",
+            DIAGNOSE_FILENAME if not _public_archive_enabled() else DIAGNOSE_FILENAME + ".zip",
+            contents if not _public_archive_enabled() else _zip_bytes(contents),
+            "text/plain" if not _public_archive_enabled() else "application/zip",
+        )
+        steps.append((
+            f"POST {public_url} (upload: {label}; {len(body)} bytes on the wire)",
+            {"method": "POST", "url": public_url,
+             "headers": {**base, "Content-Type": content_type}, "data": body,
+             "_upload": True},
+        ))
 
     steps.append((
         f"GET  {drive_url} (drive listing, unauthenticated)",
@@ -1278,7 +1350,8 @@ def diagnose_upload(timeout: float = 30.0, path: Path | None = None) -> bool:
          "headers": _upload_base_headers()},
     ))
     probe_body, probe_type = _encode_multipart(
-        _upload_form_fields(), "file", DIAGNOSE_FILENAME, benign_small, "text/plain"
+        _upload_form_fields(), "file", DIAGNOSE_FILENAME,
+        b"tg://proxy?server=probe.example&port=443&secret=probe\n", "text/plain",
     )
     steps.append((
         f"POST {drive_url} (drive upload POST, unauthenticated)",
@@ -1287,54 +1360,14 @@ def diagnose_upload(timeout: float = 30.0, path: Path | None = None) -> bool:
          "data": probe_body},
     ))
 
-    session = requests.Session()
-    _configure_session(session)
-    results: list[tuple[str, str]] = []
     print(f"Runner egress IP: {_egress_ip()}")
-    try:
-        for label, kwargs in steps:
-            try:
-                response = session.request(
-                    timeout=(min(UPLOAD_CONNECT_TIMEOUT, timeout), timeout), **kwargs
-                )
-            except requests.exceptions.RequestException as exc:
-                results.append((label, f"FAILED ({type(exc).__name__}: {_one_line(exc, 120)})"))
-                break
-            results.append((
-                label,
-                f"answered HTTP {response.status_code} ({len(response.content)} bytes)",
-            ))
-    finally:
-        session.close()
+    results = _run_probe_steps(steps, timeout)
 
-    print("\nUpload host probe (first failure is the interesting one):")
-    for label, outcome in results:
-        print(f"  [{'ok  ' if outcome.startswith('answered') else 'FAIL'}] {label}\n         -> {outcome}")
+    print("\nUpload host probe:")
+    for entry in results:
+        print(f"  [{'ok  ' if entry['ok'] else 'FAIL'}] {entry['label']}\n         -> {entry['verdict']}")
     _explain_probe(results)
-    return all(outcome.startswith("answered") for _, outcome in results)
-
-
-def _benign_payload_matching(real_bytes: bytes, benign_small: bytes) -> bytes:
-    """Benign contents whose *request body* matches the real upload's.
-
-    The comparison has to be made on the wire, not on the raw text: the public
-    endpoint uploads a zip, and repetitive text compresses ~20x while random
-    bytes barely compress at all. Padding with random bytes therefore changes the
-    body length one-for-one, which is what makes the two probes comparable.
-    """
-    if not real_bytes:
-        return benign_small * 30
-    real_body = len(_probe_request_body(real_bytes))
-    payload = (BENIGN_PROBE_LINE * (real_body // len(BENIGN_PROBE_LINE) + 2)).encode()
-    for _ in range(20):
-        delta = real_body - len(_probe_request_body(payload))
-        if abs(delta) <= 24:
-            break
-        if delta > 0:
-            payload += secrets.token_bytes(delta)
-        else:
-            payload = payload[: max(len(BENIGN_PROBE_LINE), len(payload) + delta)]
-    return payload
+    return all(entry["ok"] for entry in results)
 
 
 def _probe_request_body(contents: bytes) -> bytes:
@@ -1353,37 +1386,50 @@ def _probe_request_body(contents: bytes) -> bytes:
     return body
 
 
-def _explain_probe(results: list[tuple[str, str]]) -> None:
-    """Read the size/content matrix back to the operator."""
-    answered = [label for label, outcome in results if outcome.startswith("answered")]
-    failed = [label for label, outcome in results if not outcome.startswith("answered")]
-    if not failed:
-        print("\nEvery probe was answered, so the host accepts these requests from "
-              "this runner - including a multipart upload of the real size. The "
-              "failing upload is then about the real request or a transient host "
-              "problem, not a blanket block.")
+def _zip_bytes(contents: bytes) -> bytes:
+    """The zip the uploader would send for ``contents``."""
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / DIAGNOSE_FILENAME
+        source.write_bytes(contents)
+        return build_archive(source)[0]
+
+
+def _explain_probe(results: list[dict]) -> None:
+    """Report the observed pattern without inventing a cause."""
+    uploads = [e for e in results if "upload:" in e["label"]]
+    if not results or all(e["ok"] for e in results):
+        print("\nEvery probe was answered. If the uploads above say ACCEPTED, the "
+              "host takes these requests from this runner, so a failing job is "
+              "about the real request or a transient host problem.")
         return
-    first_fail = failed[0]
-    print(f"\nThe host stopped answering at: {first_fail}")
-    if "small, benign" in first_fail:
-        print("Even a tiny benign upload is dropped, so the host objects to the "
-              "multipart upload itself (or to this runner), not to the file.")
-        return
-    small_ok = any("small, benign" in label for label in answered)
-    large_benign_ok = any("real size" in label for label in answered)
-    real_failed = any("the real file" in label for label in failed)
-    if small_ok and not large_benign_ok:
-        print("A small upload is answered but a real-size one is not: the host "
-              "drops larger request bodies. Try a smaller output file, or "
-              "UPLOADKON_TCP_MSS=0 in case the MSS clamp is fragmenting the body.")
-        return
-    if large_benign_ok and real_failed:
-        print("Benign contents of the same size are accepted, so the host is "
-              "inspecting and rejecting the file's contents.")
-        return
-    print("Compare the failing step with the one before it to see what the host "
-          "objects to, and use UPLOADKON_PROXY if it is this runner that is "
-          "refused.")
+
+    failed = next((e for e in results if not e["ok"]), None)
+    print(f"\nFirst unanswered probe: {failed['label'] if failed else ''}")
+    if failed:
+        print(f"  -> {failed['verdict']}")
+    dropped = [e for e in uploads if e["verdict"].startswith("DROPPED")]
+    silent = [e for e in uploads if e["verdict"].startswith("NO RESPONSE")]
+    accepted = [e for e in uploads if e["verdict"].startswith("ACCEPTED")]
+    rejected = [e for e in uploads if e["verdict"].startswith("REJECTED")]
+
+    if rejected:
+        print("\nSome uploads were answered with an explicit rejection, so the host "
+              "is processing them; read the rejection text above - that is the "
+              "reason, not a network problem.")
+    if accepted and dropped:
+        print("\nThe host accepts some uploads and drops others, so this is not a "
+              "blanket block of this runner. Compare the sizes and contents of the "
+              "ACCEPTED and DROPPED rows above to see which one it objects to.")
+    if silent:
+        print("\nNO RESPONSE means the host accepted the request and then went "
+              "quiet - a server-side stall rather than a refusal. Retry later, or "
+              "raise UPLOADKON_TIMEOUT if the host is merely slow.")
+    if dropped and not accepted:
+        print("\nEvery upload was dropped, including the smallest, so the host is "
+              "refusing the multipart upload itself (or this runner). Set "
+              "UPLOADKON_PROXY to route around it.")
+    print("\nIf this is reproducible from a normal network but not from the "
+          "runner, the difference is the runner's IP: use UPLOADKON_PROXY.")
 
 
 def verify_public_link(url: str, timeout: float = 60.0) -> bool:
